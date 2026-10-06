@@ -142,6 +142,29 @@ namespace sekicraft::input
 		void*             g_targetSetCursorPos = nullptr;
 		void*             g_targetGetRawInputData = nullptr;
 		std::atomic<int>  g_cntGetCursorPos{ 0 }, g_cntSetCursorPos{ 0 }, g_cntRawInput{ 0 }, g_cntDiState{ 0 }, g_cntDiData{ 0 };
+		std::atomic<GameThreadTick> g_tick{ nullptr };
+		std::atomic<std::int64_t>   g_lastTickQpc{ 0 };
+		std::atomic<DWORD>          g_tickThread{ 0 };
+
+		// Sekiro polls four keyboard devices per frame back to back; run the tick on the first.
+		void maybeTick()
+		{
+			const GameThreadTick tick = g_tick.load();
+			if (!tick)
+				return;
+			LARGE_INTEGER now, freq;
+			QueryPerformanceCounter(&now);
+			QueryPerformanceFrequency(&freq);
+			const std::int64_t last = g_lastTickQpc.load();
+			if (now.QuadPart - last < freq.QuadPart / 250)  // at most every 4 ms
+				return;
+			g_lastTickQpc = now.QuadPart;
+			const DWORD thread = GetCurrentThreadId();
+			if (g_tickThread.exchange(thread) != thread)
+				logf("input: game-thread tick running on thread %lu", thread);
+			tick();
+		}
+
 		POINT             g_parked{};  // guarded by g_mutex
 		bool              g_haveParked = false;
 
@@ -190,6 +213,7 @@ namespace sekicraft::input
 		{
 			InFlight guard;
 			++g_cntDiState;
+			maybeTick();
 			const HRESULT hr = g_origGetDeviceState(self, size, data);
 			if (FAILED(hr) || !g_routing || !data)
 				return hr;
@@ -316,6 +340,7 @@ namespace sekicraft::input
 	void uninstall()
 	{
 		g_routing = false;
+		g_tick = nullptr;
 		if (g_targetGetDeviceState)
 			MH_DisableHook(g_targetGetDeviceState);
 		if (g_targetGetDeviceData)
@@ -348,6 +373,11 @@ namespace sekicraft::input
 	}
 
 	bool routing() { return g_routing; }
+
+	void setGameThreadTick(GameThreadTick tick)
+	{
+		g_tick = tick;
+	}
 
 	Pending take()
 	{

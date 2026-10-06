@@ -36,8 +36,23 @@ namespace sekicraft::game
 		constexpr std::uintptr_t kCamMatrix = 0x10;          // float[4][4]
 		constexpr std::uintptr_t kCamFov = 0x50;             // float, vertical, radians
 
+		// FrpgHavokMan: "mov rbx, [rip+rel32]" at the start of this pattern; physics world at +0x98.
+		constexpr const char* kHavokManAob = "48 8B 1D ?? ?? ?? ?? F3 0F 10 4D";
+		constexpr std::uintptr_t kHavokManStatic106 = 0x3D6D640;
+		constexpr std::uintptr_t kHavokManWorld = 0x98;
+		// A call to FrpgCastRay: "call rel32; test al, al; je +0x4F".
+		constexpr const char* kCastRayCallAob = "E8 ?? ?? ?? ?? 84 C0 74 4F 0F";
+		constexpr std::uintptr_t kCastRay106 = 0x94CC50;
+		constexpr std::uint8_t kCastRayPrologue[16] = { 0x48, 0x8B, 0xC4, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8D };
+		constexpr std::uint32_t kCastRayFilter = 0x4E;
+
+		using CastRayFn = bool (*)(std::uintptr_t world, std::uint32_t filter, const float* start, const float* delta,
+			float* hitPos, float* hitNormal, float* fraction, std::uintptr_t* hitObject);
+
 		std::uintptr_t g_worldChrManStatic = 0;
 		std::uintptr_t g_fieldAreaStatic = 0;
+		std::uintptr_t g_havokManStatic = 0;
+		CastRayFn      g_castRay = nullptr;
 
 		std::optional<std::vector<int>> parsePattern(const char* text)
 		{
@@ -144,7 +159,68 @@ namespace sekicraft::game
 		}
 		logf("game: FieldArea at sekiro.exe+0x%llX%s", (unsigned long long)(g_fieldAreaStatic - base),
 			g_fieldAreaStatic - base == kFieldAreaStatic106 ? " (matches 1.06)" : " (differs from 1.06!)");
+
+		if (const std::uintptr_t hit = scan(kHavokManAob)) {
+			std::int32_t rel = 0;
+			read(hit + 3, rel);
+			g_havokManStatic = hit + 7 + rel;
+		} else {
+			g_havokManStatic = base + kHavokManStatic106;
+		}
+		std::uintptr_t castRay = 0;
+		if (const std::uintptr_t hit = scan(kCastRayCallAob)) {
+			std::int32_t rel = 0;
+			read(hit + 1, rel);
+			castRay = hit + 5 + rel;
+		} else {
+			castRay = base + kCastRay106;
+		}
+		std::uint8_t prologue[16] = {};
+		if (read(castRay, prologue) && std::memcmp(prologue, kCastRayPrologue, sizeof(prologue)) == 0)
+			g_castRay = reinterpret_cast<CastRayFn>(castRay);
+		logf("game: FrpgHavokMan at sekiro.exe+0x%llX%s; FrpgCastRay at sekiro.exe+0x%llX%s", (unsigned long long)(g_havokManStatic - base),
+			g_havokManStatic - base == kHavokManStatic106 ? " (matches 1.06)" : " (differs from 1.06!)", (unsigned long long)(castRay - base),
+			g_castRay ? (castRay - base == kCastRay106 ? " (matches 1.06)" : " (prologue ok, differs from 1.06)") : " (prologue mismatch: ray casts off)");
 		return true;
+	}
+
+	bool castRayReady()
+	{
+		return g_castRay != nullptr;
+	}
+
+	namespace
+	{
+		bool callCastRay(std::uintptr_t world, const float* start, const float* delta, float* hit, float* normal, float* fraction, std::uintptr_t* object)
+		{
+			__try {
+				return g_castRay(world, kCastRayFilter, start, delta, hit, normal, fraction, object);
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+	}
+
+	bool castRay(Vec3 start, Vec3 delta, RayHit& out)
+	{
+		if (!g_castRay)
+			return false;
+		const std::uintptr_t havokMan = deref(g_havokManStatic);
+		const std::uintptr_t world = havokMan ? deref(havokMan + kHavokManWorld) : 0;
+		if (world < 0x10000)
+			return false;
+		alignas(16) float s[4] = { start.x, start.y, start.z, 1.0f };
+		alignas(16) float d[4] = { delta.x, delta.y, delta.z, 0.0f };
+		alignas(16) float hit[4] = {};
+		alignas(16) float normal[4] = {};
+		float fraction = 0;
+		std::uintptr_t object = 0;
+		if (!callCastRay(world, s, d, hit, normal, &fraction, &object))
+			return false;
+		out.pos = { hit[0], hit[1], hit[2] };
+		out.normal = { normal[0], normal[1], normal[2] };
+		out.fraction = fraction;
+		return std::isfinite(hit[0]) && std::isfinite(hit[1]) && std::isfinite(hit[2]) && std::isfinite(normal[1]);
 	}
 
 	namespace

@@ -6,6 +6,7 @@
 //   F10       Minecraft controls: keyboard and mouse go to Minecraft (Sekiro sees an idle
 //             keyboard and mouse), Minecraft's player position drives Wolf, and Sekiro's camera
 //             becomes a first-person camera at Minecraft's eye.
+#include "collision.h"
 #include "game.h"
 #include "input.h"
 #include "log.h"
@@ -47,6 +48,53 @@ namespace
 
 	double horizDist(double ax, double az, double bx, double bz) { return std::hypot(ax - bx, az - bz); }
 
+	// ---- F8 ray probe (runs on the game thread) ----
+	// Casts down, then up, through Wolf's column, continuing past each hit, and logs every surface:
+	// tells us whether ray casts hit surfaces from behind and whether Wolf's own body is hit.
+	std::atomic<bool> g_probeRequested{ false };
+
+	void probeColumn(game::Vec3 at, float dirY)
+	{
+		const float span = 30.0f;
+		game::Vec3 start{ at.x, at.y - dirY * span, at.z };
+		float remaining = 2 * span;
+		for (int i = 0; i < 16 && remaining > 0.05f; ++i) {
+			game::RayHit hit{};
+			if (!game::castRay(start, { 0, dirY * remaining, 0 }, hit)) {
+				logf("probe %s: hit %d: nothing more (%.1f m left)", dirY < 0 ? "down" : "up", i, remaining);
+				return;
+			}
+			logf("probe %s: hit %d at y %.3f (%+.2f m from Wolf's feet) normal (%.2f, %.2f, %.2f) fraction %.3f", dirY < 0 ? "down" : "up", i,
+				hit.pos.y, hit.pos.y - at.y, hit.normal.x, hit.normal.y, hit.normal.z, hit.fraction);
+			const float moved = std::abs(hit.pos.y - start.y) + 0.02f;
+			remaining -= moved;
+			start = { at.x, hit.pos.y + dirY * 0.02f, at.z };
+		}
+	}
+
+	void onGameThreadTick()
+	{
+		collision::tickGameThread();
+		if (!g_probeRequested.exchange(false))
+			return;
+		game::PlayerState wolf{};
+		if (!game::readPlayer(wolf)) {
+			logf("probe: no player");
+			return;
+		}
+		logf("probe: Wolf at (%.2f, %.2f, %.2f); casting through his column", wolf.pos.x, wolf.pos.y, wolf.pos.z);
+		probeColumn(wolf.pos, -1.0f);
+		probeColumn(wolf.pos, 1.0f);
+		// A sideways ray at chest height, toward where Wolf faces: walls.
+		game::RayHit hit{};
+		const game::Vec3 chest{ wolf.pos.x, wolf.pos.y + 1.2f, wolf.pos.z };
+		const game::Vec3 fwd{ -std::sin(wolf.theta) * 20.0f, 0, -std::cos(wolf.theta) * 20.0f };
+		if (game::castRay(chest, fwd, hit))
+			logf("probe forward: hit at %.2f m, normal (%.2f, %.2f, %.2f)", hit.fraction * 20.0f, hit.normal.x, hit.normal.y, hit.normal.z);
+		else
+			logf("probe forward: nothing within 20 m");
+	}
+
 	DWORD WINAPI worker(void*)
 	{
 		GameLink link;
@@ -71,11 +119,11 @@ namespace
 		st.gameHour = 12.0f;
 
 		Mode mode = Mode::kSekiro;
-		bool f9 = false, f10 = false;
+		bool f8 = false, f9 = false, f10 = false;
 		bool linked = false, wasInGame = false, haveFloor = false, haveFloorHeight = false;
 		double floorX = 0, floorZ = 0, floorY = 0;
 		game::Vec3 lastSent{ 1e9f, 1e9f, 1e9f };
-		ULONGLONG lastTeleport = 0, lastLog = 0;
+		ULONGLONG lastTeleport = 0, lastLog = 0, lastStats = 0;
 		std::uint64_t lastFrame = 0;
 		float lookYaw = 0, lookPitch = 0, sensitivity = 0.5f;
 		int camWrites = 0, camFails = 0;
@@ -111,8 +159,10 @@ namespace
 				wasInGame = inGame;
 				haveFloor = haveFloorHeight = false;
 				logf(inGame ? "core: Wolf is in the world" : "core: no player (title screen or loading)");
-				if (!inGame)
+				if (!inGame) {
 					toSekiro("no player");
+					collision::reset();
+				}
 			}
 			st.flags = inGame ? proto::kSkyInGame : 0;
 
@@ -122,6 +172,12 @@ namespace
 				sensitivity = mc.sensitivity;
 
 			// ---- mode switches ----
+			if (pressed(VK_F8, f8)) {
+				if (game::castRayReady())
+					g_probeRequested = true;
+				else
+					logf("core: F8 ignored: ray casts unavailable");
+			}
 			if (pressed(VK_F9, f9))
 				toSekiro("F9");
 			if (pressed(VK_F10, f10) && mode == Mode::kSekiro) {
@@ -157,10 +213,13 @@ namespace
 			if (inGame) {
 				const game::Vec3 m = game::toMc(wolf.pos);
 
-				// Temporary floor at Wolf's height (real collision comes in Phase 3). While Minecraft
-				// drives, Wolf's height is Minecraft's (jumps!), so the floor keeps its height then.
+				// Sekiro's real collision, measured with ray casts on the game thread. Without ray
+				// casts: a temporary flat floor at Wolf's height (while Minecraft drives, Wolf's height
+				// is Minecraft's, so the floor keeps its height then).
+				if (game::castRayReady())
+					collision::update(link, true, m, st.collisionEpoch);
 				const bool followHeight = mode == Mode::kSekiro && std::abs(m.y - floorY) > 0.3;
-				if (!haveFloor || followHeight || horizDist(m.x, m.z, floorX, floorZ) > 24) {
+				if (!game::castRayReady() && (!haveFloor || followHeight || horizDist(m.x, m.z, floorX, floorZ) > 24)) {
 					haveFloor = true;
 					floorX = m.x;
 					floorZ = m.z;
@@ -201,6 +260,10 @@ namespace
 
 			link.writeSkyState(st);
 
+			if (now - lastStats >= 5000 && inGame && game::castRayReady()) {
+				lastStats = now;
+				logf("%s", collision::stats().c_str());
+			}
 			if (now - lastLog >= 1000 && inGame) {
 				lastLog = now;
 				const std::uint64_t frames = mc.frameCounter - lastFrame;
@@ -230,6 +293,7 @@ extern "C" __declspec(dllexport) bool sekicraft_start(const wchar_t* dir)
 	if (!game::init())
 		return false;
 	g_inputHooked = input::install();
+	input::setGameThreadTick(&onGameThreadTick);
 	g_stop = false;
 	g_thread = CreateThread(nullptr, 0, worker, nullptr, 0, nullptr);
 	return g_thread != nullptr;
@@ -245,6 +309,7 @@ extern "C" __declspec(dllexport) void sekicraft_stop()
 	}
 	if (g_inputHooked)
 		input::uninstall();
+	collision::reset();
 	g_inputHooked = false;
 	closeLog();
 }

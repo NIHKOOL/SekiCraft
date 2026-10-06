@@ -16,3 +16,4 @@ tools/me3/
 # python / RE captures
 __pycache__/
 tools/re/*.csv
+.vscode/

@@ -49,6 +49,21 @@ namespace sekicraft::game
 	// control, so the first-person camera doesn't look out through his head.
 	bool setPlayerDrawn(bool drawn);
 
+	// ---- physics queries ----------------------------------------------------------------------
+	// FrpgCastRay (sekiro.exe+0x94CC50 on 1.06) against FrpgHavokMan's physics world
+	// ([[sekiro.exe+0x3D6D640]+0x98]), filter 0x4E as the community tools use it. Interface facts
+	// from SekiroTool (MIT, Shilkey & Centz). Call it on the game's own thread only.
+
+	struct RayHit
+	{
+		Vec3  pos;       // Sekiro coords
+		Vec3  normal;
+		float fraction;  // along delta
+	};
+
+	bool castRayReady();
+	bool castRay(Vec3 start, Vec3 delta, RayHit& out);
+
 	// ---- camera -------------------------------------------------------------------------------
 	// Sekiro's debug free camera: [[FieldArea]+0x20]+0xE8, a 4x4 matrix at +0x10 (rows right, up,
 	// forward, position; left-handed: right x up = forward), vertical FOV (radians) at +0x50.
