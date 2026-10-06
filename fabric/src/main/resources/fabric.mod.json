@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "id": "sekicraft",
+  "version": "${version}",
+  "name": "SekiCraft",
+  "description": "Play Sekiro with Minecraft physics, inventory and blocks. Built on SkyCraft by chasmlol (MIT).",
+  "authors": ["wattikorn", "chasmlol (SkyCraft)"],
+  "contact": {
+    "sources": "https://github.com/chasmlol/SkyCraft"
+  },
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "main": ["dev.sekicraft.SekiCraft"],
+    "client": ["dev.sekicraft.client.SekiCraftClient"]
+  },
+  "mixins": [
+    "sekicraft.mixins.json",
+    { "config": "sekicraft.client.mixins.json", "environment": "client" }
+  ],
+  "depends": {
+    "fabricloader": ">=0.19.5",
+    "minecraft": "~26.3",
+    "java": ">=25",
+    "fabric-api": "*"
+  }
+}

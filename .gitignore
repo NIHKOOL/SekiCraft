@@ -1,0 +1,18 @@
+# gradle / loom
+fabric/.gradle/
+fabric/build/
+fabric/run/
+fabric/out/
+fabric/*-log.txt
+# cmake
+sekiro/build/
+tools/fakegame/build/
+# downloaded tools (me3 portable)
+tools/me3/
+# ide
+.vs/
+.idea/
+*.iml
+# python / RE captures
+__pycache__/
+tools/re/*.csv

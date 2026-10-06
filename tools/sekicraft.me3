@@ -1,0 +1,8 @@
+profileVersion = "v1"
+
+[[supports]]
+game = "sekiro"
+
+# The SekiCraft game-side DLL (build it with CMake in sekiro/ first).
+[[natives]]
+path = '../sekiro/build/sekicraft.dll'

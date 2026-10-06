@@ -1,0 +1,250 @@
+// sekicraft_core.dll: SekiCraft's logic inside sekiro.exe, hot-reloaded by sekicraft.dll.
+//
+// Two control modes, switched with hotkeys while Sekiro has focus:
+//   F9 / Esc  Sekiro controls (default): you play Wolf normally. Minecraft follows him, standing
+//             on a temporary flat floor at his height.
+//   F10       Minecraft controls: keyboard and mouse go to Minecraft (Sekiro sees an idle
+//             keyboard and mouse), Minecraft's player position drives Wolf, and Sekiro's camera
+//             becomes a first-person camera at Minecraft's eye.
+#include "game.h"
+#include "input.h"
+#include "log.h"
+#include "sekicraft_flatfloor.h"
+
+#include <windows.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <string>
+
+namespace proto = sekicraft::proto;
+using namespace sekicraft;
+
+namespace
+{
+	std::atomic<bool> g_stop{ false };
+	HANDLE            g_thread = nullptr;
+	bool              g_inputHooked = false;
+
+	enum class Mode { kSekiro, kMinecraft };
+
+	bool gameHasFocus()
+	{
+		DWORD pid = 0;
+		GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+		return pid == GetCurrentProcessId();
+	}
+
+	// Edge-triggered hotkey (only while Sekiro is the foreground window).
+	bool pressed(int vk, bool& wasDown)
+	{
+		const bool down = gameHasFocus() && (GetAsyncKeyState(vk) & 0x8000);
+		const bool edge = down && !wasDown;
+		wasDown = down;
+		return edge;
+	}
+
+	double horizDist(double ax, double az, double bx, double bz) { return std::hypot(ax - bx, az - bz); }
+
+	DWORD WINAPI worker(void*)
+	{
+		GameLink link;
+		for (;;) {
+			const auto r = link.open();
+			if (r == GameLink::OpenResult::kCreated || r == GameLink::OpenResult::kTookOver) {
+				logf("core: shared memory %ls %s", proto::kMappingName, r == GameLink::OpenResult::kCreated ? "created" : "reopened");
+				break;
+			}
+			logf(r == GameLink::OpenResult::kOtherGameLive ? "core: another game side owns the link; retrying" : "core: couldn't create shared memory; retrying");
+			for (int i = 0; i < 50 && !g_stop; ++i)
+				Sleep(100);
+			if (g_stop)
+				return 0;
+		}
+
+		proto::SkyState st{};
+		st.collisionEpoch = link.previousCollisionEpoch();
+		st.teleportSeq = link.previousTeleportSeq();
+		st.viewportW = 1920;
+		st.viewportH = 1080;
+		st.gameHour = 12.0f;
+
+		Mode mode = Mode::kSekiro;
+		bool f9 = false, f10 = false;
+		bool linked = false, wasInGame = false, haveFloor = false, haveFloorHeight = false;
+		double floorX = 0, floorZ = 0, floorY = 0;
+		game::Vec3 lastSent{ 1e9f, 1e9f, 1e9f };
+		ULONGLONG lastTeleport = 0, lastLog = 0;
+		std::uint64_t lastFrame = 0;
+		float lookYaw = 0, lookPitch = 0, sensitivity = 0.5f;
+		int camWrites = 0, camFails = 0;
+
+		auto toSekiro = [&](const char* why) {
+			if (mode == Mode::kSekiro)
+				return;
+			mode = Mode::kSekiro;
+			input::setRouting(false);
+			game::setFreeCamera(false);
+			game::setPlayerDrawn(true);
+			lastSent = { 1e9f, 1e9f, 1e9f };  // teleport Minecraft back onto Wolf
+			logf("core: %s -> Sekiro controls", why);
+		};
+
+		while (!g_stop) {
+			const ULONGLONG now = GetTickCount64();
+			link.heartbeat();
+			link.drainRender();
+			link.drainEvents([](const proto::McEvent&) {});
+
+			const bool alive = link.minecraftAlive();
+			if (alive != linked) {
+				linked = alive;
+				logf(alive ? "core: Minecraft linked (pid %u)" : "core: Minecraft heartbeat lost", link.minecraftPid());
+				if (!alive)
+					toSekiro("Minecraft gone");
+			}
+
+			game::PlayerState wolf{};
+			const bool inGame = game::readPlayer(wolf);
+			if (inGame != wasInGame) {
+				wasInGame = inGame;
+				haveFloor = haveFloorHeight = false;
+				logf(inGame ? "core: Wolf is in the world" : "core: no player (title screen or loading)");
+				if (!inGame)
+					toSekiro("no player");
+			}
+			st.flags = inGame ? proto::kSkyInGame : 0;
+
+			proto::McState mc{};
+			const bool haveMc = linked && link.readMcState(mc) && (mc.flags & proto::kMcInWorld);
+			if (haveMc && mc.sensitivity > 0)
+				sensitivity = mc.sensitivity;
+
+			// ---- mode switches ----
+			if (pressed(VK_F9, f9))
+				toSekiro("F9");
+			if (pressed(VK_F10, f10) && mode == Mode::kSekiro) {
+				if (!g_inputHooked)
+					logf("core: F10 ignored: input hooks aren't installed");
+				else if (!inGame || !haveMc)
+					logf("core: F10 ignored: %s", !inGame ? "no player" : "Minecraft isn't in its world yet");
+				else {
+					mode = Mode::kMinecraft;
+					lookYaw = game::yawToMc(wolf.theta);
+					lookPitch = 0;
+					camWrites = camFails = 0;
+					input::setRouting(true);
+					game::setFreeCamera(true);
+					logf("core: F10 -> Minecraft controls");
+				}
+			}
+
+			// ---- input (only gathered while routing) ----
+			const input::Pending in = input::take();
+			for (const auto& e : in.events)
+				link.sendInput(e.type, e.code, e.a, e.b, e.c);
+			if (in.escapePressed)
+				toSekiro("Esc");
+			if (mode == Mode::kMinecraft && !(mc.flags & proto::kMcScreenOpen)) {
+				// Minecraft's own mouse-look formula, integrated here so the camera has no added latency.
+				const float s = sensitivity * 0.6f + 0.2f;
+				const float factor = s * s * s * 8.0f * 0.15f;
+				lookYaw = std::fmod(lookYaw + in.lookDx * factor, 360.0f);
+				lookPitch = std::clamp(lookPitch + in.lookDy * factor, -90.0f, 90.0f);
+			}
+
+			if (inGame) {
+				const game::Vec3 m = game::toMc(wolf.pos);
+
+				// Temporary floor at Wolf's height (real collision comes in Phase 3). While Minecraft
+				// drives, Wolf's height is Minecraft's (jumps!), so the floor keeps its height then.
+				const bool followHeight = mode == Mode::kSekiro && std::abs(m.y - floorY) > 0.3;
+				if (!haveFloor || followHeight || horizDist(m.x, m.z, floorX, floorZ) > 24) {
+					haveFloor = true;
+					floorX = m.x;
+					floorZ = m.z;
+					if (mode == Mode::kSekiro || !haveFloorHeight)
+						floorY = m.y;
+					haveFloorHeight = true;
+					sekicraft::sendFlatFloor(link, ++st.collisionEpoch, floorX, floorZ, floorY);
+				}
+
+				if (mode == Mode::kSekiro) {
+					// Minecraft follows Wolf; a hair above the floor so it lands on it.
+					st.posX = m.x;
+					st.posY = m.y + 0.02;
+					st.posZ = m.z;
+					st.yaw = game::yawToMc(wolf.theta);
+					st.pitch = 0;
+					const double moved = std::abs(m.x - lastSent.x) + std::abs(m.y - lastSent.y) + std::abs(m.z - lastSent.z);
+					if (moved > 0.02 && now - lastTeleport >= 50) {
+						++st.teleportSeq;
+						lastTeleport = now;
+						lastSent = m;
+					}
+				} else if (haveMc) {
+					// Minecraft drives: Wolf stands where Minecraft's player is, facing its look.
+					st.yaw = lookYaw;
+					st.pitch = lookPitch;
+					game::writePlayerPos(game::fromMc({ float(mc.x), float(mc.y), float(mc.z) }));
+					game::writePlayerTheta(game::yawFromMc(lookYaw));
+					game::setPlayerDrawn(false);  // every frame: the game may turn it back on
+					const game::Vec3 eye = game::fromMc({ float(mc.eyeX), float(mc.eyeY), float(mc.eyeZ) });
+					const float fov = (mc.fovDeg > 1 ? mc.fovDeg : 70.0f) * float(3.14159265358979 / 180.0);
+					if (game::writeCamera(eye, game::yawFromMc(lookYaw), game::yawFromMc(lookPitch), fov))
+						++camWrites;
+					else
+						++camFails;
+				}
+			}
+
+			link.writeSkyState(st);
+
+			if (now - lastLog >= 1000 && inGame) {
+				lastLog = now;
+				const std::uint64_t frames = mc.frameCounter - lastFrame;
+				lastFrame = mc.frameCounter;
+				if (mode == Mode::kSekiro) {
+					logf("sekiro: wolf (%.2f, %.2f, %.2f) theta %.3f | mc (%.2f, %.2f, %.2f) flags 0x%02x %llu fps", wolf.pos.x, wolf.pos.y, wolf.pos.z, wolf.theta,
+						mc.x, mc.y, mc.z, mc.flags, (unsigned long long)frames);
+				} else {
+					logf("minecraft: mc (%.2f, %.2f, %.2f) yaw %.1f pitch %.1f flags 0x%02x %llu fps -> wolf (%.2f, %.2f, %.2f) | camera writes %d, failed %d | %s",
+						mc.x, mc.y, mc.z, lookYaw, lookPitch, mc.flags, (unsigned long long)frames, wolf.pos.x, wolf.pos.y, wolf.pos.z, camWrites, camFails,
+						input::callStats().c_str());
+				}
+			}
+			Sleep(mode == Mode::kMinecraft ? 2 : 8);
+		}
+
+		toSekiro("unloading");
+		logf("core: stopped");
+		return 0;
+	}
+}
+
+extern "C" __declspec(dllexport) bool sekicraft_start(const wchar_t* dir)
+{
+	openLog(std::wstring(dir) + L"sekicraft.log", false);
+	logf("core: starting (built " __DATE__ " " __TIME__ ")");
+	if (!game::init())
+		return false;
+	g_inputHooked = input::install();
+	g_stop = false;
+	g_thread = CreateThread(nullptr, 0, worker, nullptr, 0, nullptr);
+	return g_thread != nullptr;
+}
+
+extern "C" __declspec(dllexport) void sekicraft_stop()
+{
+	g_stop = true;
+	if (g_thread) {
+		WaitForSingleObject(g_thread, 5000);
+		CloseHandle(g_thread);
+		g_thread = nullptr;
+	}
+	if (g_inputHooked)
+		input::uninstall();
+	g_inputHooked = false;
+	closeLog();
+}
