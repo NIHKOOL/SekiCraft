@@ -63,6 +63,7 @@ namespace sekicraft::input
 		void*             g_targetGetDeviceState = nullptr;
 		void*             g_targetGetDeviceData = nullptr;
 		std::atomic<bool> g_routing{ false };
+		std::atomic<bool> g_escapeToMinecraft{ false };  // a Minecraft screen is open: Esc closes it
 		std::atomic<int>  g_inFlight{ 0 };
 
 		std::mutex                                   g_mutex;  // guards everything below
@@ -107,7 +108,7 @@ namespace sekicraft::input
 			g_keyDown[dik] = down;
 			if (dik == kDikF9 || dik == kDikF10)
 				return;
-			if (dik == kDikEscape) {
+			if (dik == kDikEscape && !g_escapeToMinecraft) {
 				if (down)
 					g_pending.escapePressed = true;
 				return;
@@ -146,9 +147,12 @@ namespace sekicraft::input
 		std::atomic<std::int64_t>   g_lastTickQpc{ 0 };
 		std::atomic<DWORD>          g_tickThread{ 0 };
 
+		void ensureWindowHook();
+
 		// Sekiro polls four keyboard devices per frame back to back; run the tick on the first.
 		void maybeTick()
 		{
+			ensureWindowHook();
 			const GameThreadTick tick = g_tick.load();
 			if (!tick)
 				return;
@@ -202,11 +206,121 @@ namespace sekicraft::input
 			return g_origSetCursorPos(x, y);
 		}
 
+		std::atomic<int> g_rawMouseButtons{ 0 };
+		bool             g_loggedRawMouse = false;
+
+		// Sekiro reads mouse buttons and the wheel as raw input. While routing, they go to Minecraft
+		// and Sekiro gets a mouse that never clicks or moves.
 		UINT WINAPI hookGetRawInputData(HRAWINPUT raw, UINT command, LPVOID data, PUINT size, UINT header)
 		{
 			InFlight guard;
 			++g_cntRawInput;
-			return g_origGetRawInputData(raw, command, data, size, header);
+			const UINT r = g_origGetRawInputData(raw, command, data, size, header);
+			if (!g_routing || command != RID_INPUT || !data || r == UINT(-1) || r < sizeof(RAWINPUTHEADER))
+				return r;
+			auto* in = static_cast<RAWINPUT*>(data);
+			if (in->header.dwType != RIM_TYPEMOUSE)
+				return r;
+			RAWMOUSE& m = in->data.mouse;
+			const USHORT flags = m.usButtonFlags;
+			if (flags) {
+				std::lock_guard lock(g_mutex);
+				static constexpr struct { USHORT down, up; int index; } kButtons[] = {
+					{ RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_LEFT_BUTTON_UP, 0 },
+					{ RI_MOUSE_RIGHT_BUTTON_DOWN, RI_MOUSE_RIGHT_BUTTON_UP, 1 },
+					{ RI_MOUSE_MIDDLE_BUTTON_DOWN, RI_MOUSE_MIDDLE_BUTTON_UP, 2 },
+					{ RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_4_UP, 3 },
+					{ RI_MOUSE_BUTTON_5_DOWN, RI_MOUSE_BUTTON_5_UP, 4 },
+				};
+				for (const auto& b : kButtons) {
+					if (flags & b.down)
+						buttonChanged(b.index, true);
+					if (flags & b.up)
+						buttonChanged(b.index, false);
+				}
+				if (flags & RI_MOUSE_WHEEL)
+					push(proto::kInScroll, 0, SHORT(m.usButtonData));
+				if (flags & (RI_MOUSE_LEFT_BUTTON_DOWN | RI_MOUSE_RIGHT_BUTTON_DOWN | RI_MOUSE_MIDDLE_BUTTON_DOWN)) {
+					++g_rawMouseButtons;
+					if (!g_loggedRawMouse) {
+						g_loggedRawMouse = true;
+						logf("input: mouse buttons arrive as raw input (flags 0x%04x)", flags);
+					}
+				}
+			}
+			m.usButtonFlags = 0;
+			m.usButtonData = 0;
+			m.lLastX = m.lLastY = 0;
+			return r;
+		}
+
+		// ---- window messages ----
+		// Sekiro also sees the wheel and clicks as window messages; while routing they're swallowed.
+		HWND              g_window = nullptr;
+		WNDPROC           g_origWndProc = nullptr;
+		std::atomic<int>  g_cntSwallowed{ 0 };
+
+		LRESULT CALLBACK hookWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+		{
+			InFlight guard;
+			if (g_routing) {
+				switch (msg) {
+				case WM_MOUSEWHEEL:
+				case WM_MOUSEHWHEEL:
+				case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_LBUTTONDBLCLK:
+				case WM_RBUTTONDOWN: case WM_RBUTTONUP: case WM_RBUTTONDBLCLK:
+				case WM_MBUTTONDOWN: case WM_MBUTTONUP: case WM_MBUTTONDBLCLK:
+				case WM_XBUTTONDOWN: case WM_XBUTTONUP: case WM_XBUTTONDBLCLK:
+					++g_cntSwallowed;
+					return msg == WM_XBUTTONDOWN || msg == WM_XBUTTONUP || msg == WM_XBUTTONDBLCLK ? TRUE : 0;
+				default:
+					break;
+				}
+			}
+			return CallWindowProcW(g_origWndProc, hwnd, msg, wp, lp);
+		}
+
+		// Subclass Sekiro's window the first time its keyboard is polled while it's in front (a
+		// minimized fullscreen window can't be told apart from others before that).
+		void ensureWindowHook()
+		{
+			if (g_window || !g_tick.load())
+				return;
+			HWND fg = GetForegroundWindow();
+			DWORD pid = 0;
+			GetWindowThreadProcessId(fg, &pid);
+			if (!fg || pid != GetCurrentProcessId())
+				return;
+			g_window = fg;
+			g_origWndProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(g_window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&hookWndProc)));
+			logf("input: window %p subclassed", static_cast<void*>(g_window));
+		}
+
+		// Sekiro's main window: the biggest visible top-level window of this process.
+		HWND findGameWindow()
+		{
+			struct Search
+			{
+				HWND best = nullptr;
+				LONG area = 0;
+			} search;
+			EnumWindows(
+				[](HWND hwnd, LPARAM lp) -> BOOL {
+					auto* s = reinterpret_cast<Search*>(lp);
+					DWORD pid = 0;
+					GetWindowThreadProcessId(hwnd, &pid);
+					RECT r;
+					if (pid == GetCurrentProcessId() && IsWindowVisible(hwnd) && GetClientRect(hwnd, &r)) {
+						const LONG area = (r.right - r.left) * (r.bottom - r.top);
+						if (area > s->area) {
+							s->area = area;
+							s->best = hwnd;
+						}
+					}
+					return TRUE;
+				},
+				reinterpret_cast<LPARAM>(&search));
+			return search.best;
 		}
 
 		HRESULT STDMETHODCALLTYPE hookGetDeviceState(IDirectInputDevice8W* self, DWORD size, LPVOID data)
@@ -227,7 +341,8 @@ namespace sekicraft::input
 				}
 				const BYTE esc = keys[kDikEscape];
 				std::memset(keys, 0, size);
-				keys[kDikEscape] = esc;  // Esc still reaches Sekiro (its menu); the core hands control back
+				if (!g_escapeToMinecraft)
+					keys[kDikEscape] = esc;  // Esc still reaches Sekiro (its menu); the core hands control back
 			} else if (type == DI8DEVTYPE_MOUSE && size >= sizeof(DIMOUSESTATE)) {
 				auto* m = static_cast<DIMOUSESTATE2*>(data);
 				const int buttons = size >= sizeof(DIMOUSESTATE2) ? 8 : 4;
@@ -326,14 +441,21 @@ namespace sekicraft::input
 		} else {
 			logf("input: cursor functions hooked");
 		}
+
+		if (HWND w = findGameWindow(); w && IsWindowVisible(w) && !IsIconic(w)) {
+			g_window = w;
+			g_origWndProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(g_window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&hookWndProc)));
+			logf("input: window %p subclassed", static_cast<void*>(g_window));
+		}  // else: ensureWindowHook does it once Sekiro is in front
 		return true;
 	}
 
 	std::string callStats()
 	{
-		char buf[160];
-		std::snprintf(buf, sizeof(buf), "GetCursorPos %d, SetCursorPos %d, GetRawInputData %d, DI GetDeviceState %d, DI GetDeviceData %d",
-			g_cntGetCursorPos.exchange(0), g_cntSetCursorPos.exchange(0), g_cntRawInput.exchange(0), g_cntDiState.exchange(0), g_cntDiData.exchange(0));
+		char buf[200];
+		std::snprintf(buf, sizeof(buf), "GetCursorPos %d, SetCursorPos %d, GetRawInputData %d, DI GetDeviceState %d, DI GetDeviceData %d, swallowed msgs %d",
+			g_cntGetCursorPos.exchange(0), g_cntSetCursorPos.exchange(0), g_cntRawInput.exchange(0), g_cntDiState.exchange(0), g_cntDiData.exchange(0),
+			g_cntSwallowed.exchange(0));
 		return buf;
 	}
 
@@ -341,6 +463,10 @@ namespace sekicraft::input
 	{
 		g_routing = false;
 		g_tick = nullptr;
+		if (g_window && g_origWndProc &&
+			reinterpret_cast<WNDPROC>(GetWindowLongPtrW(g_window, GWLP_WNDPROC)) == &hookWndProc)
+			SetWindowLongPtrW(g_window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_origWndProc));
+		g_window = nullptr;
 		if (g_targetGetDeviceState)
 			MH_DisableHook(g_targetGetDeviceState);
 		if (g_targetGetDeviceData)
@@ -373,6 +499,11 @@ namespace sekicraft::input
 	}
 
 	bool routing() { return g_routing; }
+
+	void setEscapeToMinecraft(bool toMinecraft)
+	{
+		g_escapeToMinecraft = toMinecraft;
+	}
 
 	void setGameThreadTick(GameThreadTick tick)
 	{

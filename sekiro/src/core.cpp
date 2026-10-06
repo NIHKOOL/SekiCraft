@@ -10,6 +10,7 @@
 #include "game.h"
 #include "input.h"
 #include "log.h"
+#include "overlay.h"
 #include "sekicraft_flatfloor.h"
 
 #include <windows.h>
@@ -27,6 +28,7 @@ namespace
 	std::atomic<bool> g_stop{ false };
 	HANDLE            g_thread = nullptr;
 	bool              g_inputHooked = false;
+	bool              g_overlayHooked = false;
 
 	enum class Mode { kSekiro, kMinecraft };
 
@@ -111,6 +113,8 @@ namespace
 				return 0;
 		}
 
+		overlay::setLink(&link);
+
 		proto::SkyState st{};
 		st.collisionEpoch = link.previousCollisionEpoch();
 		st.teleportSeq = link.previousTeleportSeq();
@@ -126,6 +130,8 @@ namespace
 		ULONGLONG lastTeleport = 0, lastLog = 0, lastStats = 0;
 		std::uint64_t lastFrame = 0;
 		float lookYaw = 0, lookPitch = 0, sensitivity = 0.5f;
+		float cursorX = 0, cursorY = 0;
+		bool screenWasOpen = false;
 		int camWrites = 0, camFails = 0;
 
 		auto toSekiro = [&](const char* why) {
@@ -196,12 +202,47 @@ namespace
 				}
 			}
 
+			// Sekiro's real screen size (Minecraft sizes its overlay to match).
+			std::uint32_t viewW = 0, viewH = 0;
+			overlay::viewport(viewW, viewH);
+			if (viewW && viewH) {
+				st.viewportW = viewW;
+				st.viewportH = viewH;
+			}
+
 			// ---- input (only gathered while routing) ----
 			const input::Pending in = input::take();
+			const bool screenOpen = mode == Mode::kMinecraft && haveMc && (mc.flags & proto::kMcScreenOpen);
+			input::setEscapeToMinecraft(screenOpen);
+			if (screenOpen) {
+				// A Minecraft screen (inventory, chat, ...): the mouse moves a cursor, in overlay pixels.
+				if (!screenWasOpen) {
+					cursorX = st.viewportW * 0.5f;
+					cursorY = st.viewportH * 0.5f;
+				}
+				const float nx = std::clamp(cursorX + in.lookDx, 0.0f, float(st.viewportW) - 1);
+				const float ny = std::clamp(cursorY + in.lookDy, 0.0f, float(st.viewportH) - 1);
+				if (nx != cursorX || ny != cursorY || !screenWasOpen) {
+					cursorX = nx;
+					cursorY = ny;
+					link.sendInput(proto::kInCursor, 0, int(cursorX), int(cursorY));
+				}
+			}
+			screenWasOpen = screenOpen;
 			for (const auto& e : in.events)
 				link.sendInput(e.type, e.code, e.a, e.b, e.c);
 			if (in.escapePressed)
 				toSekiro("Esc");
+			{
+				overlay::Settings ov;
+				ov.show = mode == Mode::kMinecraft && haveMc;
+				ov.cursor = screenOpen;
+				ov.cursorX = cursorX;
+				ov.cursorY = cursorY;
+				ov.crosshair = ov.show && !screenOpen && mc.cameraMode == 0;
+				ov.guiScale = int(mc.guiScale);
+				overlay::update(ov);
+			}
 			if (mode == Mode::kMinecraft && !(mc.flags & proto::kMcScreenOpen)) {
 				// Minecraft's own mouse-look formula, integrated here so the camera has no added latency.
 				const float s = sensitivity * 0.6f + 0.2f;
@@ -281,6 +322,7 @@ namespace
 		}
 
 		toSekiro("unloading");
+		overlay::setLink(nullptr);
 		logf("core: stopped");
 		return 0;
 	}
@@ -294,6 +336,7 @@ extern "C" __declspec(dllexport) bool sekicraft_start(const wchar_t* dir)
 		return false;
 	g_inputHooked = input::install();
 	input::setGameThreadTick(&onGameThreadTick);
+	g_overlayHooked = g_inputHooked && overlay::install();  // MinHook is initialized by input::install
 	g_stop = false;
 	g_thread = CreateThread(nullptr, 0, worker, nullptr, 0, nullptr);
 	return g_thread != nullptr;
@@ -301,6 +344,10 @@ extern "C" __declspec(dllexport) bool sekicraft_start(const wchar_t* dir)
 
 extern "C" __declspec(dllexport) void sekicraft_stop()
 {
+	// The overlay reads the link from the render thread: unhook it before the worker closes it.
+	if (g_overlayHooked)
+		overlay::uninstall();
+	g_overlayHooked = false;
 	g_stop = true;
 	if (g_thread) {
 		WaitForSingleObject(g_thread, 5000);

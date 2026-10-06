@@ -104,6 +104,16 @@ From the community Sekiro Practice cheat table, verified live:
   - While Minecraft has control, keys become SDL scancodes for Minecraft. Cursor motion is measured, the cursor is parked again, and the motion becomes look.
   - Sekiro sees an idle keyboard and a still cursor. Esc still reaches Sekiro and hands control back.
 
+- **Mouse buttons and wheel:** raw input (`GetRawInputData`, `RIM_TYPEMOUSE`). While Minecraft has control, they're forwarded and then zeroed for Sekiro.
+- **Window messages:** Sekiro also reacts to `WM_MOUSEWHEEL` and click messages; scrolling made the view jitter. Sekiro's window is subclassed (lazily, once it's in front) and those messages are swallowed while routing.
+- **Esc:** with a Minecraft screen open, Esc goes to Minecraft (closes the screen). Otherwise it goes to Sekiro and hands control back.
+
+### 5.3 Overlay (Phase 4, `sekiro/src/overlay.cpp`)
+
+- **Hook:** `IDXGISwapChain::Present`, found through a throwaway swap chain and hooked with MinHook. It runs on Sekiro's render thread, the same thread as the game tick.
+- **Drawing:** each frame, Minecraft's newest overlay (hand + HUD + screens, premultiplied RGBA) is taken from the shared triple buffer. The reader's slot is kept in `OverlayCtl::pad`, so it survives core reloads. It's uploaded and drawn full-screen with SkyCraft's shader (MIT). The crosshair uses Minecraft's invert blend, and a cursor is drawn while a Minecraft screen is open.
+- **Viewport:** Sekiro's back-buffer size goes to Minecraft as the viewport.
+
 **Puppet result (Phase 2 test):** writing the position every frame from MC moves Wolf smoothly, and the camera follows. Sekiro keeps the horizontal position (drift < 2 cm) but nudges the height by a few cm, presumably snapping to its real ground. **Wolf does not animate**: he glides with his legs still, because his locomotion animation only runs when Sekiro's own movement drives him. That doesn't matter now: per the decision below, Wolf is hidden while Minecraft controls.
 
 **Decision (2026-10-07): you play as the Minecraft player**, as in SkyCraft. While Minecraft has control:
@@ -189,7 +199,7 @@ Each phase ends in something you can see working.
 | 1 ◐ | **See Sekiro's state** (player position, facing and handedness done; enemies remain) | In-game debug window shows live player position, rotation, area and nearby enemies. Coordinate handedness pinned |
 | 2 ✅ | **Puppet** | Walking in MC (on a flat floor at Sekiro ground height) moves Wolf. Camera follows MC's view |
 | 3 ✅ | **Walk Ashina in MC physics** (ray-cast stage) | Collision field (A or B) lets you sprint-jump around Ashina Outskirts; cliffs and slopes behave |
-| 4 | **Overlay** | MC hotbar, hearts, inventory and hand drawn in Sekiro |
+| 4 ✅ | **Overlay** | MC hotbar, hearts, inventory and hand drawn in Sekiro |
 | 5 | **Blocks** | Place and break blocks on Sekiro surfaces, depth-correct |
 | 6 | **Combat** | Fight Ashina soldiers with MC weapons; they hit back; posture and deathblows |
 | 7 | **Digging** | Dig holes into Sekiro's ground with correct drops (§7) |

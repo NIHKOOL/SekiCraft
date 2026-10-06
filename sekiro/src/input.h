@@ -17,6 +17,10 @@ namespace sekicraft::input
 	void setRouting(bool toMinecraft);
 	bool routing();
 
+	// While a Minecraft screen (inventory, chat, ...) is open, Esc goes to Minecraft to close it
+	// instead of handing control back to Sekiro.
+	void setEscapeToMinecraft(bool toMinecraft);
+
 	struct Pending
 	{
 		std::vector<proto::InputEvent> events;  // keys, buttons, scroll (Minecraft codes)

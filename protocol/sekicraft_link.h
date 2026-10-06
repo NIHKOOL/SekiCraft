@@ -53,6 +53,14 @@ namespace sekicraft
 				prevTeleportSeq_ = at<proto::SkyState>(proto::kOffSkyState)->teleportSeq;
 				prevEpoch_ = at<proto::SkyState>(proto::kOffSkyState)->collisionEpoch;
 			}
+			// Overlay triple buffer: a new game process starts it over (Minecraft restarts its side
+			// when it sees our pid change). A reload inside the same process keeps going; our front
+			// slot lives in OverlayCtl::pad so it survives the reload.
+			auto* overlay = at<proto::OverlayCtl>(proto::kOffOverlayCtl);
+			if (!existed || hdr->skyrimPid != GetCurrentProcessId()) {
+				std::atomic_ref<std::uint32_t>(overlay->state).store(0, std::memory_order_release);
+				overlay->pad = 2;
+			}
 			hdr->magic = proto::kMagic;
 			hdr->version = proto::kVersion;
 			hdr->skyrimPid = GetCurrentProcessId();
@@ -185,6 +193,33 @@ namespace sekicraft
 			}
 			tailRef.store(head, std::memory_order_release);
 			return head - start;
+		}
+
+		// ---- overlay (Minecraft's hand + HUD + screens; triple buffer, we read) ----------------
+		// Minecraft renders into its back slot and swaps it into the middle with the dirty bit set;
+		// we swap our front slot for the middle one when it's dirty.
+
+		bool acquireOverlayFrame()
+		{
+			auto* ctl = at<proto::OverlayCtl>(proto::kOffOverlayCtl);
+			auto state = std::atomic_ref<std::uint32_t>(ctl->state);
+			if (!(state.load(std::memory_order_acquire) & proto::kOverlayDirty))
+				return false;
+			const std::uint32_t old = state.exchange(ctl->pad & 3, std::memory_order_acq_rel);
+			ctl->pad = old & 3;
+			return true;
+		}
+
+		const proto::OverlaySlotHdr* overlayHeader() const
+		{
+			const std::uint32_t front = at<proto::OverlayCtl>(proto::kOffOverlayCtl)->pad & 3;
+			return at<proto::OverlaySlotHdr>(proto::kOffOverlaySlotHdr + sizeof(proto::OverlaySlotHdr) * front);
+		}
+
+		const std::uint8_t* overlayPixels() const
+		{
+			const std::uint32_t front = at<proto::OverlayCtl>(proto::kOffOverlayCtl)->pad & 3;
+			return at<std::uint8_t>(proto::kOffOverlayPixels + proto::kOverlaySlotBytes * front);
 		}
 
 		// ---- event ring (we consume) ----------------------------------------------------------
