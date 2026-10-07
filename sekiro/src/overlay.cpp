@@ -3,6 +3,8 @@
 #include "overlay.h"
 
 #include "log.h"
+#include "scenedepth.h"
+#include "world.h"
 
 #include <d3d11.h>
 #include <d3dcompiler.h>
@@ -11,8 +13,11 @@
 
 #include <MinHook.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cstring>
+#include <string>
 #include <mutex>
 
 namespace sekicraft::overlay
@@ -29,6 +34,8 @@ namespace sekicraft::overlay
 		std::mutex                 g_settingsMutex;
 		Settings                   g_settings;
 		std::atomic<std::uint32_t> g_viewW{ 0 }, g_viewH{ 0 };
+		std::atomic<int>           g_frames{ 0 }, g_shownFrames{ 0 }, g_worldFrames{ 0 }, g_camFrames{ 0 };
+		std::atomic<int>           g_cameraLag{ 1 };  // measured: Sekiro draws a frame with the previous frame's camera
 
 		// Render-thread state (only touched inside Present).
 		ID3D11Device*             device = nullptr;
@@ -118,6 +125,8 @@ float4 PSMain(VSOut i) : SV_Target {
 			safeRelease(raster);
 			safeRelease(depth);
 			safeRelease(params);
+			world::releaseGpu();
+			scenedepth::releaseGpu();
 			safeRelease(context);
 			safeRelease(device);
 			texW = texH = 0;
@@ -292,8 +301,12 @@ float4 PSMain(VSOut i) : SV_Target {
 			if (!link || !initResources(swapChain))
 				return;
 			uploadLatestFrame(*link);  // keep consuming even while hidden, so the newest frame is ready
-			if (!st.show || !haveFrame)
+			++g_frames;
+			if (!st.show) {
+				scenedepth::onPresent(device, context, g_viewW, g_viewH, false);
 				return;
+			}
+			++g_shownFrames;
 
 			ID3D11Texture2D* backBuffer = nullptr;
 			if (FAILED(swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&backBuffer))))
@@ -333,6 +346,9 @@ float4 PSMain(VSOut i) : SV_Target {
 			ID3D11ShaderResourceView* oldSrv = nullptr;
 			ID3D11SamplerState*       oldSampler = nullptr;
 			ID3D11Buffer*             oldCb = nullptr;
+			ID3D11Buffer*             oldVsCb[2]{};
+			ID3D11Buffer*             oldVb = nullptr;
+			UINT                      oldStride = 0, oldOffset = 0;
 			context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, oldRtv, &oldDsv);
 			context->OMGetBlendState(&oldBlend, oldFactor, &oldMask);
 			context->RSGetState(&oldRaster);
@@ -345,6 +361,35 @@ float4 PSMain(VSOut i) : SV_Target {
 			context->PSGetShaderResources(0, 1, &oldSrv);
 			context->PSGetSamplers(0, 1, &oldSampler);
 			context->PSGetConstantBuffers(0, 1, &oldCb);
+			context->VSGetConstantBuffers(0, 2, oldVsCb);
+			context->IAGetVertexBuffers(0, 1, &oldVb, &oldStride, &oldOffset);
+
+			scenedepth::onPresent(device, context, bbDesc.Width, bbDesc.Height, true);
+
+			// Minecraft's blocks first, in the 3D view; its hand and HUD go on top.
+			if (st.world) {
+				++g_worldFrames;
+				// Keep the last few cameras: if Sekiro draws a frame with an older camera than the one
+				// in memory now, the blocks must use that one too (cameraLag frames back).
+				static game::CameraState history[4]{};
+				static bool haveHistory[4]{};
+				static int head = 0;
+				head = (head + 1) & 3;
+				haveHistory[head] = game::readFreeCamera(history[head]);
+				const int slot = (head - std::clamp(g_cameraLag.load(), 0, 3) + 4) & 3;
+				game::CameraState cam = history[slot];
+				const bool haveCam = haveHistory[slot];
+				if (haveCam)
+					++g_camFrames;
+				static int lastLogged = -1;
+				if (int(haveCam) != lastLogged) {
+					lastLogged = int(haveCam);
+					logf("overlay: drawing blocks; free camera %s (fov %.3f, pos %.1f %.1f %.1f)", haveCam ? "readable" : "NOT readable", cam.fov,
+						cam.world[12], cam.world[13], cam.world[14]);
+				}
+				if (haveCam)
+					world::draw(device, context, rtv, bbDesc.Width, bbDesc.Height, cam, scenedepth::view());
+			}
 
 			bool invert = false;
 			D3D11_MAPPED_SUBRESOURCE mapped{};
@@ -373,27 +418,30 @@ float4 PSMain(VSOut i) : SV_Target {
 
 			D3D11_VIEWPORT vp{ 0, 0, float(bbDesc.Width), float(bbDesc.Height), 0, 1 };
 			const float factor[4]{};
-			context->OMSetRenderTargets(1, &rtv, nullptr);
-			context->OMSetBlendState(blend, factor, 0xFFFFFFFF);
-			context->OMSetDepthStencilState(depth, 0);
-			context->RSSetState(raster);
-			context->RSSetViewports(1, &vp);
-			context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-			context->IASetInputLayout(nullptr);
-			context->VSSetShader(vs, nullptr, 0);
-			context->PSSetShader(ps, nullptr, 0);
-			context->PSSetShaderResources(0, 1, &srv);
-			context->PSSetSamplers(0, 1, &sampler);
-			context->PSSetConstantBuffers(0, 1, &params);
-			context->Draw(3, 0);
-			if (invert) {
-				context->OMSetBlendState(invertBlend, factor, 0xFFFFFFFF);
-				context->PSSetShader(psInvert, nullptr, 0);
+			if (haveFrame) {
+				context->OMSetRenderTargets(1, &rtv, nullptr);
+				context->OMSetBlendState(blend, factor, 0xFFFFFFFF);
+				context->OMSetDepthStencilState(depth, 0);
+				context->RSSetState(raster);
+				context->RSSetViewports(1, &vp);
+				context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+				context->IASetInputLayout(nullptr);
+				context->VSSetShader(vs, nullptr, 0);
+				context->PSSetShader(ps, nullptr, 0);
+				context->PSSetShaderResources(0, 1, &srv);
+				context->PSSetSamplers(0, 1, &sampler);
+				context->PSSetConstantBuffers(0, 1, &params);
 				context->Draw(3, 0);
+				if (invert) {
+					context->OMSetBlendState(invertBlend, factor, 0xFFFFFFFF);
+					context->PSSetShader(psInvert, nullptr, 0);
+					context->Draw(3, 0);
+				}
 			}
 
-			// Restore.
 			context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, oldRtv, oldDsv);
+			context->VSSetConstantBuffers(0, 2, oldVsCb);
+			context->IASetVertexBuffers(0, 1, &oldVb, &oldStride, &oldOffset);
 			context->OMSetBlendState(oldBlend, oldFactor, oldMask);
 			context->OMSetDepthStencilState(oldDepth, oldStencil);
 			context->RSSetState(oldRaster);
@@ -417,6 +465,9 @@ float4 PSMain(VSOut i) : SV_Target {
 			safeRelease(oldSrv);
 			safeRelease(oldSampler);
 			safeRelease(oldCb);
+			safeRelease(oldVsCb[0]);
+			safeRelease(oldVsCb[1]);
+			safeRelease(oldVb);
 			safeRelease(rtv);
 		}
 
@@ -438,7 +489,13 @@ float4 PSMain(VSOut i) : SV_Target {
 			return hr;
 		}
 
-		// IDXGISwapChain::Present from a throwaway device + swap chain on a hidden window.
+		// IDXGISwapChain::Present (and ID3D11DeviceContext::ClearDepthStencilView) from a throwaway
+		// device + swap chain on a hidden window.
+		void* g_foundClearDsv = nullptr;
+		void* g_foundOMSet = nullptr;
+		void* g_foundOMSetUav = nullptr;
+		void* g_foundDeferredOMSet = nullptr;
+
 		void* findPresent()
 		{
 			WNDCLASSEXW wc{ sizeof(wc) };
@@ -462,6 +519,14 @@ float4 PSMain(VSOut i) : SV_Target {
 			void* present = nullptr;
 			if (SUCCEEDED(D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &scd, &sc, &dev, nullptr, &ctx))) {
 				present = (*reinterpret_cast<void***>(sc))[8];
+				g_foundClearDsv = (*reinterpret_cast<void***>(ctx))[53];  // ClearDepthStencilView
+				g_foundOMSet = (*reinterpret_cast<void***>(ctx))[33];     // OMSetRenderTargets
+				g_foundOMSetUav = (*reinterpret_cast<void***>(ctx))[34];  // OMSetRenderTargetsAndUnorderedAccessViews
+				ID3D11DeviceContext* deferred = nullptr;
+				if (SUCCEEDED(dev->CreateDeferredContext(0, &deferred))) {
+					g_foundDeferredOMSet = (*reinterpret_cast<void***>(deferred))[33];
+					deferred->Release();
+				}
 				sc->Release();
 				dev->Release();
 				ctx->Release();
@@ -485,6 +550,7 @@ float4 PSMain(VSOut i) : SV_Target {
 			g_targetPresent = nullptr;
 			return false;
 		}
+		scenedepth::install(g_foundClearDsv, g_foundOMSet, g_foundOMSetUav, g_foundDeferredOMSet);
 		g_enabled = true;
 		logf("overlay: Present hooked (%p)", g_targetPresent);
 		return true;
@@ -500,6 +566,7 @@ float4 PSMain(VSOut i) : SV_Target {
 		g_link = nullptr;
 		for (int i = 0; i < 50 && device; ++i)
 			Sleep(10);
+		scenedepth::uninstall();
 		MH_DisableHook(g_targetPresent);
 		MH_RemoveHook(g_targetPresent);
 		for (int i = 0; i < 200 && g_inFlight > 0; ++i)
@@ -516,6 +583,19 @@ float4 PSMain(VSOut i) : SV_Target {
 	{
 		std::lock_guard lock(g_settingsMutex);
 		g_settings = settings;
+	}
+
+	std::string stats()
+	{
+		char buf[160];
+		std::snprintf(buf, sizeof(buf), "overlay: %d frames, %d with Minecraft shown, %d with blocks on, %d with a readable camera",
+			g_frames.exchange(0), g_shownFrames.exchange(0), g_worldFrames.exchange(0), g_camFrames.exchange(0));
+		return buf;
+	}
+
+	void setCameraLag(int frames)
+	{
+		g_cameraLag = frames;
 	}
 
 	void viewport(std::uint32_t& width, std::uint32_t& height)

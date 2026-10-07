@@ -71,6 +71,16 @@ namespace sekicraft::game
 
 	bool setFreeCamera(bool on);
 
+	struct CameraState
+	{
+		float world[16];  // rows: right, up, forward, position (Sekiro coords)
+		float fov;        // vertical, radians
+		float aspect, nearZ, farZ;
+	};
+
+	// The free camera as it is now (what Sekiro renders while Minecraft has control).
+	bool readFreeCamera(CameraState& out);
+
 	// Puts the free camera at pos (Sekiro coords) looking along facing theta (Wolf's convention)
 	// and pitch (radians, positive looks down, like Minecraft).
 	bool writeCamera(Vec3 pos, float theta, float pitch, float fovRadians);

@@ -44,7 +44,8 @@ namespace sekicraft
 				return OpenResult::kFailed;
 			}
 			auto* hdr = header();
-			if (existed && hdr->magic == proto::kMagic && GetTickCount64() - gameBeat().load() < 3000 && hdr->skyrimPid != GetCurrentProcessId()) {
+			const std::uint32_t pid = GetCurrentProcessId();
+			if (existed && hdr->magic == proto::kMagic && GetTickCount64() - gameBeat().load() < 3000 && (hdr->skyrimPid & proto::kPidMask) != pid) {
 				otherPid_ = hdr->skyrimPid;
 				close();
 				return OpenResult::kOtherGameLive;
@@ -53,17 +54,19 @@ namespace sekicraft
 				prevTeleportSeq_ = at<proto::SkyState>(proto::kOffSkyState)->teleportSeq;
 				prevEpoch_ = at<proto::SkyState>(proto::kOffSkyState)->collisionEpoch;
 			}
-			// Overlay triple buffer: a new game process starts it over (Minecraft restarts its side
-			// when it sees our pid change). A reload inside the same process keeps going; our front
-			// slot lives in OverlayCtl::pad so it survives the reload.
+			// Every open looks like a new game side to Minecraft: a reopen inside the same process
+			// (the core was hot-reloaded and has lost everything Minecraft sent) flips the pid's top
+			// bit, and Minecraft resends its atlas, meshes and the rest when the value changes. It
+			// also restarts the overlay triple buffer then, so we do too (our front slot lives in
+			// OverlayCtl::pad).
+			const bool samePid = existed && (hdr->skyrimPid & proto::kPidMask) == pid;
+			const std::uint32_t pidValue = samePid ? (hdr->skyrimPid ^ ~proto::kPidMask) : pid;
 			auto* overlay = at<proto::OverlayCtl>(proto::kOffOverlayCtl);
-			if (!existed || hdr->skyrimPid != GetCurrentProcessId()) {
-				std::atomic_ref<std::uint32_t>(overlay->state).store(0, std::memory_order_release);
-				overlay->pad = 2;
-			}
+			std::atomic_ref<std::uint32_t>(overlay->state).store(0, std::memory_order_release);
+			overlay->pad = 2;
 			hdr->magic = proto::kMagic;
 			hdr->version = proto::kVersion;
-			hdr->skyrimPid = GetCurrentProcessId();
+			hdr->skyrimPid = pidValue;
 			heartbeat();
 			return existed ? OpenResult::kTookOver : OpenResult::kCreated;
 		}

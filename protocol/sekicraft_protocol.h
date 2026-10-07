@@ -42,11 +42,15 @@ namespace sekicraft::proto
 	inline constexpr std::uint64_t kMappingBytes = kOffRenderRing + kRenderRingBytes;
 
 	// ---- header @0x0 ------------------------------------------------------------------------
+	// The game side's pid changes whenever it (re)opens the link, even within one process, so
+	// Minecraft resends everything it caches. The process id itself is skyrimPid & kPidMask.
+	inline constexpr std::uint32_t kPidMask = 0x7FFFFFFF;
+
 	struct Header
 	{
 		std::uint32_t magic;
 		std::uint32_t version;
-		std::uint32_t skyrimPid;
+		std::uint32_t skyrimPid;          // game process id; bit 31 flips each time the game side reopens the link (kPidMask)
 		std::uint32_t mcPid;
 		std::uint64_t skyrimHeartbeatMs;  // GetTickCount64() at last Skyrim frame
 		std::uint64_t mcHeartbeatMs;      // GetTickCount64() at last MC frame

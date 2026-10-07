@@ -157,7 +157,7 @@ public final class SkyClient {
 	private static boolean gaveUpWaiting;
 
 	private static void quitWithSkyrim(Minecraft minecraft) {
-		int pid = SkyLink.skyrimPid();
+		int pid = SkyLink.skyrimPid() & 0x7FFFFFFF; // bit 31 only marks a reopened link (kPidMask)
 		long now = System.currentTimeMillis();
 		if (QUIT_WITH_SKYRIM && START_HIDDEN && pid == 0 && !tookOver && !gaveUpWaiting && now - STARTED_AT > NEVER_CONNECTED_QUIT_MS) {
 			gaveUpWaiting = true;

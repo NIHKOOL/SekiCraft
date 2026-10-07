@@ -114,6 +114,26 @@ From the community Sekiro Practice cheat table, verified live:
 - **Drawing:** each frame, Minecraft's newest overlay (hand + HUD + screens, premultiplied RGBA) is taken from the shared triple buffer. The reader's slot is kept in `OverlayCtl::pad`, so it survives core reloads. It's uploaded and drawn full-screen with SkyCraft's shader (MIT). The crosshair uses Minecraft's invert blend, and a cursor is drawn while a Minecraft screen is open.
 - **Viewport:** Sekiro's back-buffer size goes to Minecraft as the viewport.
 
+### 5.4 Blocks in Sekiro's view (Phase 5, `sekiro/src/world.cpp`, `scenedepth.cpp`)
+
+**Data:** Minecraft meshes its own blocks and streams them through the render ring: an atlas plus a triangle list per 16³ section. The core collects them on the worker thread, and the Present hook uploads and draws them before Minecraft's hand and HUD. A reloaded core flips bit 31 of the header pid (`kPidMask`), so Minecraft resends everything.
+
+**Camera:**
+- Blocks are drawn from Sekiro's free camera.
+- **Sekiro draws each frame with the previous frame's camera**, measured with the F7 test. So the blocks use the camera from one frame back (`overlay::setCameraLag`, default 1).
+- Camera and Wolf writes happen on Sekiro's main thread at frame start. The game tick and Present share thread 6820.
+- The FOV is fixed at 70°. Minecraft's sprint FOV made blocks bob, because Sekiro eases into FOV changes.
+
+**Depth:**
+- Sekiro renders its scene on **deferred contexts**. Their `OMSetRenderTargets` is a different function from the immediate context's, and it's hooked to find the depth buffers. Sekiro never calls `ClearDepthStencilView`.
+- The scene depth buffer is 1920×1080, `R32G8X24_TYPELESS` (D32 + S8), and shader-readable. The other depth buffers are shadow maps (4096², R16) and half-resolution buffers.
+- **Sekiro's projection is reversed with an infinite far plane:** stored depth = near / view distance, near = 0.08 (camera +0x58), sky = 0. Measured: depth × ray distance ≈ 0.08 from 1.7 m to 104 m.
+- The block renderer uses the same projection, copies Sekiro's depth into its own depth buffer each frame, and tests GREATER_EQUAL. Sekiro's walls hide blocks exactly.
+
+**Not yet:**
+- Sekiro's lighting and shadows on blocks: blocks use Minecraft's light values only.
+- Dropped items, arrows and other entities (render ring `kRenScene`, world entities).
+
 **Puppet result (Phase 2 test):** writing the position every frame from MC moves Wolf smoothly, and the camera follows. Sekiro keeps the horizontal position (drift < 2 cm) but nudges the height by a few cm, presumably snapping to its real ground. **Wolf does not animate**: he glides with his legs still, because his locomotion animation only runs when Sekiro's own movement drives him. That doesn't matter now: per the decision below, Wolf is hidden while Minecraft controls.
 
 **Decision (2026-10-07): you play as the Minecraft player**, as in SkyCraft. While Minecraft has control:
@@ -200,7 +220,7 @@ Each phase ends in something you can see working.
 | 2 ✅ | **Puppet** | Walking in MC (on a flat floor at Sekiro ground height) moves Wolf. Camera follows MC's view |
 | 3 ✅ | **Walk Ashina in MC physics** (ray-cast stage) | Collision field (A or B) lets you sprint-jump around Ashina Outskirts; cliffs and slopes behave |
 | 4 ✅ | **Overlay** | MC hotbar, hearts, inventory and hand drawn in Sekiro |
-| 5 | **Blocks** | Place and break blocks on Sekiro surfaces, depth-correct |
+| 5 ◐ | **Blocks** (drawn and occluded; lighting, entities remain) | Place and break blocks on Sekiro surfaces, depth-correct |
 | 6 | **Combat** | Fight Ashina soldiers with MC weapons; they hit back; posture and deathblows |
 | 7 | **Digging** | Dig holes into Sekiro's ground with correct drops (§7) |
 | 8 | **Polish** | Idol warps across dimensions, save snapshots, resurrection ↔ MC death, auto-launch |

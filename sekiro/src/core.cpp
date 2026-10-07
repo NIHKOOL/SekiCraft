@@ -11,6 +11,8 @@
 #include "input.h"
 #include "log.h"
 #include "overlay.h"
+#include "scenedepth.h"
+#include "world.h"
 #include "sekicraft_flatfloor.h"
 
 #include <windows.h>
@@ -18,6 +20,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <mutex>
 #include <string>
 
 namespace proto = sekicraft::proto;
@@ -74,8 +77,65 @@ namespace
 		}
 	}
 
+	// ---- Minecraft driving Wolf and the camera ----
+	// The worker decides where Wolf and the camera go; the game thread writes them at the start of
+	// each frame. Sekiro draws that frame and calls Present on the same thread, so the blocks we draw
+	// in Present see exactly the camera Sekiro rendered with (no swimming).
+	struct Drive
+	{
+		bool       active = false;
+		game::Vec3 wolf{};    // Sekiro coords
+		float      theta = 0;
+		game::Vec3 eye{};     // Sekiro coords
+		float      pitch = 0; // radians
+		float      fov = 1.2f;
+	};
+	std::mutex             g_driveMutex;
+	Drive                  g_drive;
+	bool                   g_driveApplied = false;  // game thread only
+	std::atomic<int>       g_camWrites{ 0 }, g_camFails{ 0 };
+	std::atomic<float>     g_centreRay{ NAN };
+
+	void applyDrive()
+	{
+		Drive d;
+		{
+			std::lock_guard lock(g_driveMutex);
+			d = g_drive;
+		}
+		if (!d.active) {
+			if (g_driveApplied) {
+				g_driveApplied = false;
+				game::setFreeCamera(false);
+				game::setPlayerDrawn(true);
+			}
+			return;
+		}
+		if (!g_driveApplied) {
+			g_driveApplied = true;
+			game::setFreeCamera(true);
+		}
+		game::writePlayerPos(d.wolf);
+		game::writePlayerTheta(d.theta);
+		game::setPlayerDrawn(false);  // every frame: the game may turn it back on
+		if (game::writeCamera(d.eye, d.theta, d.pitch, d.fov))
+			++g_camWrites;
+		else
+			++g_camFails;
+
+		// Diagnostics for the depth buffer: how far the camera's centre ray really goes.
+		static int frame = 0;
+		if (++frame % 10 == 0 && game::castRayReady()) {
+			const float ct = std::cos(d.pitch);
+			const game::Vec3 fwd{ -std::sin(d.theta) * ct, -std::sin(d.pitch), -std::cos(d.theta) * ct };
+			game::RayHit hit{};
+			g_centreRay = game::castRay(d.eye, { fwd.x * 500, fwd.y * 500, fwd.z * 500 }, hit) ? hit.fraction * 500.0f : NAN;
+		}
+	}
+
 	void onGameThreadTick()
 	{
+		applyDrive();
 		collision::tickGameThread();
 		if (!g_probeRequested.exchange(false))
 			return;
@@ -123,7 +183,8 @@ namespace
 		st.gameHour = 12.0f;
 
 		Mode mode = Mode::kSekiro;
-		bool f8 = false, f9 = false, f10 = false;
+		bool f7 = false, f8 = false, f9 = false, f10 = false;
+		int cameraLag = 1;  // F7 cycles 0-2 (debug); 1 matches Sekiro
 		bool linked = false, wasInGame = false, haveFloor = false, haveFloorHeight = false;
 		double floorX = 0, floorZ = 0, floorY = 0;
 		game::Vec3 lastSent{ 1e9f, 1e9f, 1e9f };
@@ -132,13 +193,17 @@ namespace
 		float lookYaw = 0, lookPitch = 0, sensitivity = 0.5f;
 		float cursorX = 0, cursorY = 0;
 		bool screenWasOpen = false;
-		int camWrites = 0, camFails = 0;
 
 		auto toSekiro = [&](const char* why) {
 			if (mode == Mode::kSekiro)
 				return;
 			mode = Mode::kSekiro;
 			input::setRouting(false);
+			{
+				std::lock_guard lock(g_driveMutex);
+				g_drive.active = false;
+			}
+			// Also undo it here: the game thread may not tick again (unloading, unfocused).
 			game::setFreeCamera(false);
 			game::setPlayerDrawn(true);
 			lastSent = { 1e9f, 1e9f, 1e9f };  // teleport Minecraft back onto Wolf
@@ -148,7 +213,7 @@ namespace
 		while (!g_stop) {
 			const ULONGLONG now = GetTickCount64();
 			link.heartbeat();
-			link.drainRender();
+			link.drainRender(&world::consume);
 			link.drainEvents([](const proto::McEvent&) {});
 
 			const bool alive = link.minecraftAlive();
@@ -184,6 +249,11 @@ namespace
 				else
 					logf("core: F8 ignored: ray casts unavailable");
 			}
+			if (pressed(VK_F7, f7)) {
+				cameraLag = (cameraLag + 1) % 3;
+				overlay::setCameraLag(cameraLag);
+				logf("core: F7 -> blocks drawn with the camera from %d frame(s) ago", cameraLag);
+			}
 			if (pressed(VK_F9, f9))
 				toSekiro("F9");
 			if (pressed(VK_F10, f10) && mode == Mode::kSekiro) {
@@ -195,9 +265,8 @@ namespace
 					mode = Mode::kMinecraft;
 					lookYaw = game::yawToMc(wolf.theta);
 					lookPitch = 0;
-					camWrites = camFails = 0;
+					g_camWrites = g_camFails = 0;
 					input::setRouting(true);
-					game::setFreeCamera(true);
 					logf("core: F10 -> Minecraft controls");
 				}
 			}
@@ -236,6 +305,7 @@ namespace
 			{
 				overlay::Settings ov;
 				ov.show = mode == Mode::kMinecraft && haveMc;
+				ov.world = ov.show;  // the free camera is what Sekiro renders only while Minecraft drives
 				ov.cursor = screenOpen;
 				ov.cursorX = cursorX;
 				ov.cursorY = cursorY;
@@ -287,15 +357,18 @@ namespace
 					// Minecraft drives: Wolf stands where Minecraft's player is, facing its look.
 					st.yaw = lookYaw;
 					st.pitch = lookPitch;
-					game::writePlayerPos(game::fromMc({ float(mc.x), float(mc.y), float(mc.z) }));
-					game::writePlayerTheta(game::yawFromMc(lookYaw));
-					game::setPlayerDrawn(false);  // every frame: the game may turn it back on
-					const game::Vec3 eye = game::fromMc({ float(mc.eyeX), float(mc.eyeY), float(mc.eyeZ) });
-					const float fov = (mc.fovDeg > 1 ? mc.fovDeg : 70.0f) * float(3.14159265358979 / 180.0);
-					if (game::writeCamera(eye, game::yawFromMc(lookYaw), game::yawFromMc(lookPitch), fov))
-						++camWrites;
-					else
-						++camFails;
+					Drive d;
+					d.active = true;
+					d.wolf = game::fromMc({ float(mc.x), float(mc.y), float(mc.z) });
+					d.theta = game::yawFromMc(lookYaw);
+					d.eye = game::fromMc({ float(mc.eyeX), float(mc.eyeY), float(mc.eyeZ) });
+					d.pitch = game::yawFromMc(lookPitch);
+					// Minecraft's FOV changes while sprinting (and so around jumps); Sekiro eases into a new
+					// FOV over a few frames while our blocks would use it at once, so they'd bob. Keep
+					// Minecraft's normal 70 degrees instead.
+					d.fov = 70.0f * float(3.14159265358979 / 180.0);
+					std::lock_guard lock(g_driveMutex);
+					g_drive = d;
 				}
 			}
 
@@ -304,6 +377,9 @@ namespace
 			if (now - lastStats >= 5000 && inGame && game::castRayReady()) {
 				lastStats = now;
 				logf("%s", collision::stats().c_str());
+				logf("%s", world::stats().c_str());
+				logf("%s", overlay::stats().c_str());
+				logf("%s", scenedepth::stats().c_str());
 			}
 			if (now - lastLog >= 1000 && inGame) {
 				lastLog = now;
@@ -313,8 +389,9 @@ namespace
 					logf("sekiro: wolf (%.2f, %.2f, %.2f) theta %.3f | mc (%.2f, %.2f, %.2f) flags 0x%02x %llu fps", wolf.pos.x, wolf.pos.y, wolf.pos.z, wolf.theta,
 						mc.x, mc.y, mc.z, mc.flags, (unsigned long long)frames);
 				} else {
+					logf("depth probe: centre stored %.7f, centre ray %.2f m", scenedepth::centreDepth(), g_centreRay.load());
 					logf("minecraft: mc (%.2f, %.2f, %.2f) yaw %.1f pitch %.1f flags 0x%02x %llu fps -> wolf (%.2f, %.2f, %.2f) | camera writes %d, failed %d | %s",
-						mc.x, mc.y, mc.z, lookYaw, lookPitch, mc.flags, (unsigned long long)frames, wolf.pos.x, wolf.pos.y, wolf.pos.z, camWrites, camFails,
+						mc.x, mc.y, mc.z, lookYaw, lookPitch, mc.flags, (unsigned long long)frames, wolf.pos.x, wolf.pos.y, wolf.pos.z, g_camWrites.load(), g_camFails.load(),
 						input::callStats().c_str());
 				}
 			}

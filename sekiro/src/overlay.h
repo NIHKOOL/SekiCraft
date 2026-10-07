@@ -4,6 +4,7 @@
 #include "sekicraft_link.h"
 
 #include <cstdint>
+#include <string>
 
 namespace sekicraft::overlay
 {
@@ -13,6 +14,7 @@ namespace sekicraft::overlay
 	struct Settings
 	{
 		bool  show = false;      // draw Minecraft's layer at all (Minecraft has control)
+		bool  world = false;     // draw Minecraft's blocks in the 3D view (from the free camera)
 		bool  cursor = false;    // a Minecraft screen is open: draw a mouse cursor
 		float cursorX = 0, cursorY = 0;  // in overlay pixels
 		bool  crosshair = false; // draw Minecraft's crosshair with its invert blend
@@ -22,6 +24,11 @@ namespace sekicraft::overlay
 	// From the worker: the link to read frames from (nullptr: none) and what to draw.
 	void setLink(GameLink* link);
 	void update(const Settings& settings);
+
+	std::string stats();
+
+	// Draw blocks with the camera from this many frames ago (to match the frame Sekiro rendered).
+	void setCameraLag(int frames);
 
 	// Sekiro's back buffer size as last seen in Present (0 until the first frame).
 	void viewport(std::uint32_t& width, std::uint32_t& height);

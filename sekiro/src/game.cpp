@@ -239,6 +239,15 @@ namespace sekicraft::game
 		return cm && writeBytes(cm + kCamManFreeCamMode, &mode, 1);
 	}
 
+	bool readFreeCamera(CameraState& out)
+	{
+		const std::uintptr_t cm = cameraManager();
+		const std::uintptr_t cam = cm ? deref(cm + kCamManFreeCam) : 0;
+		float lens[4] = {};
+		return cam && readBytes(cam + kCamMatrix, out.world, sizeof(out.world)) && readBytes(cam + kCamFov, lens, sizeof(lens)) &&
+			((out.fov = lens[0]), (out.aspect = lens[1]), (out.nearZ = lens[2]), (out.farZ = lens[3]), true);
+	}
+
 	bool writeCamera(Vec3 pos, float theta, float pitch, float fovRadians)
 	{
 		const std::uintptr_t cm = cameraManager();
