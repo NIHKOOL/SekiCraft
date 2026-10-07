@@ -52,6 +52,7 @@ namespace sekicraft::input
 
 		// Keys SekiCraft keeps for itself (hotkeys) and never forwards to Minecraft.
 		constexpr std::uint8_t kDikEscape = 0x01;
+		constexpr std::uint8_t kDikF4 = 0x3E;
 		constexpr std::uint8_t kDikF9 = 0x43;
 		constexpr std::uint8_t kDikF10 = 0x44;
 
@@ -71,6 +72,10 @@ namespace sekicraft::input
 		std::array<bool, 256>                        g_keyDown{};    // as last forwarded to Minecraft
 		std::array<bool, 8>                          g_buttonDown{};
 		std::unordered_map<IDirectInputDevice8W*, BYTE> g_deviceType;  // DI8DEVTYPE_* per device
+		// Sekiro can open several keyboard (and mouse) devices and poll each one. Each keeps its own
+		// held keys; a key is down when any device has it down (else they'd fight: down, up, down...).
+		std::unordered_map<IDirectInputDevice8W*, std::array<bool, 256>> g_deviceKeys;
+		std::unordered_map<IDirectInputDevice8W*, std::array<bool, 8>>   g_deviceButtons;
 
 		struct InFlight
 		{
@@ -106,7 +111,7 @@ namespace sekicraft::input
 			if (g_keyDown[dik] == down)
 				return;
 			g_keyDown[dik] = down;
-			if (dik == kDikF9 || dik == kDikF10)
+			if (dik == kDikF4 || dik == kDikF9 || dik == kDikF10)
 				return;
 			if (dik == kDikEscape && !g_escapeToMinecraft) {
 				if (down)
@@ -273,6 +278,24 @@ namespace sekicraft::input
 				case WM_XBUTTONDOWN: case WM_XBUTTONUP: case WM_XBUTTONDBLCLK:
 					++g_cntSwallowed;
 					return msg == WM_XBUTTONDOWN || msg == WM_XBUTTONUP || msg == WM_XBUTTONDBLCLK ? TRUE : 0;
+				case WM_CHAR: {
+					// Typed text (Sekiro calls TranslateMessage), for a Minecraft screen's text boxes:
+					// chat, creative search, signs, anvils. Only while a screen is open, so the key that
+					// opens one (T, E) isn't typed into it. Control characters arrive as keys already.
+					static wchar_t highSurrogate = 0;
+					const wchar_t ch = wchar_t(wp);
+					if (IS_HIGH_SURROGATE(ch)) {
+						highSurrogate = ch;
+					} else if (g_escapeToMinecraft && ch >= 0x20 && ch != 0x7F) {
+						const std::int32_t cp = IS_LOW_SURROGATE(ch) && highSurrogate ? std::int32_t(0x10000 + ((highSurrogate - 0xD800) << 10) + (ch - 0xDC00))
+						                                                              : std::int32_t(ch);
+						highSurrogate = 0;
+						std::lock_guard lock(g_mutex);
+						push(proto::kInText, 0, cp);
+					}
+					++g_cntSwallowed;
+					return 0;
+				}
 				default:
 					break;
 				}
@@ -336,8 +359,15 @@ namespace sekicraft::input
 				auto* keys = static_cast<BYTE*>(data);
 				{
 					std::lock_guard lock(g_mutex);
+					auto& mine = g_deviceKeys[self];
 					for (int i = 0; i < 256; ++i)
-						keyChanged(std::uint8_t(i), (keys[i] & 0x80) != 0);
+						mine[i] = (keys[i] & 0x80) != 0;
+					std::array<bool, 256> any{};
+					for (const auto& [dev, held] : g_deviceKeys)
+						for (int i = 0; i < 256; ++i)
+							any[i] = any[i] || held[i];
+					for (int i = 0; i < 256; ++i)
+						keyChanged(std::uint8_t(i), any[i]);
 				}
 				const BYTE esc = keys[kDikEscape];
 				std::memset(keys, 0, size);
@@ -352,8 +382,15 @@ namespace sekicraft::input
 					g_pending.lookDy += float(m->lY);
 					if (m->lZ)
 						push(proto::kInScroll, 0, m->lZ);
+					auto& mine = g_deviceButtons[self];
 					for (int i = 0; i < buttons; ++i)
-						buttonChanged(i, (m->rgbButtons[i] & 0x80) != 0);
+						mine[i] = (m->rgbButtons[i] & 0x80) != 0;
+					for (int i = 0; i < 8; ++i) {
+						bool any = false;
+						for (const auto& [dev, held] : g_deviceButtons)
+							any = any || held[i];
+						buttonChanged(i, any);
+					}
 				}
 				std::memset(data, 0, size);
 			}
@@ -492,6 +529,8 @@ namespace sekicraft::input
 		// Start from "nothing held" either way; Minecraft gets a release-all when control leaves it.
 		g_keyDown.fill(false);
 		g_buttonDown.fill(false);
+		g_deviceKeys.clear();
+		g_deviceButtons.clear();
 		g_haveParked = false;
 		g_pending = {};
 		if (!toMinecraft)

@@ -86,6 +86,7 @@ namespace sekicraft::collision
 		{
 			int  rx = 0, rz = 0;
 			Band band;
+			bool rescan = false;  // cast again even where this generation already has a column
 		};
 
 		struct Done
@@ -100,6 +101,11 @@ namespace sekicraft::collision
 		std::deque<Job>        g_queue;
 		std::vector<Done>      g_done;
 		int                    g_generation = 0;  // bumps on reset / new epoch: in-flight work is dropped
+		// Right after a load Sekiro is still streaming in the area's collision: rays find nothing, and
+		// an empty scan would be sent as "no ground here". A new epoch waits until a ray straight down
+		// from the player hits the ground they stand on (or kGroundWaitMs passes, e.g. mid-air).
+		game::Vec3             g_groundProbe{};       // Sekiro coords
+		int                    g_groundOkGeneration = -1;
 		std::atomic<long long> g_casts{ 0 }, g_tickUs{ 0 }, g_ticks{ 0 };
 
 		// ---- game thread only ----
@@ -113,6 +119,8 @@ namespace sekicraft::collision
 			Done out;
 		};
 		Progress                              g_work;
+		int                                   g_probeGeneration = -1;
+		unsigned long long                    g_probeSince = 0, g_probeLast = 0;
 		int                                   g_cacheBand = -1;
 		int                                   g_cacheGeneration = -1;
 		std::unordered_map<long long, Column> g_cache;
@@ -128,6 +136,28 @@ namespace sekicraft::collision
 			int                      regionsSent = 0;
 		};
 		Area g_area;
+
+		// Region columns whose scan found nothing at all: probably not streamed in yet. Scanned again
+		// a few times, a few seconds apart. Worker only.
+		struct Retry
+		{
+			unsigned long long due = 0;
+			int                tries = 0;
+		};
+		std::map<std::pair<int, int>, Retry> g_retry;
+		constexpr int                       kEmptyRetries = 5;
+		constexpr unsigned long long        kEmptyRetryMs = 3000;
+		constexpr unsigned long long        kGroundWaitMs = 15000;
+
+		bool isEmpty(const Done& d)
+		{
+			if (!d.walls.empty())
+				return false;
+			for (const Column& c : d.cols)
+				if (c.n)
+					return false;
+			return true;
+		}
 
 		// Dug blocks, as Minecraft reports them per 16^3 section (kRenDug): Sekiro's geometry in them
 		// is gone. Worker only.
@@ -512,6 +542,26 @@ namespace sekicraft::collision
 				g_work = {};
 				if (g_queue.empty())
 					return;
+				if (g_groundOkGeneration != g_generation) {
+					const unsigned long long now = GetTickCount64();
+					if (g_probeGeneration != g_generation) {
+						g_probeGeneration = g_generation;
+						g_probeSince = now;
+						g_probeLast = 0;
+					}
+					if (now - g_probeLast < 100)
+						return;
+					g_probeLast = now;
+					game::RayHit hit;
+					const game::Vec3 from{ g_groundProbe.x, g_groundProbe.y + 1.5f, g_groundProbe.z };
+					const bool ground = game::castRay(from, { 0.0f, -4.0f, 0.0f }, hit);
+					++g_casts;
+					if (!ground && now - g_probeSince < kGroundWaitMs)
+						return;
+					g_groundOkGeneration = g_generation;
+					logf(ground ? "collision: ground under the player after %.1f s; scanning" : "collision: no ground under the player after %.1f s; scanning anyway",
+						(now - g_probeSince) / 1000.0);
+				}
 				g_work.active = true;
 				g_work.generation = g_generation;
 				g_work.job = g_queue.front();
@@ -542,6 +592,8 @@ namespace sekicraft::collision
 				auto it = g_cache.find(key);
 				if (it == g_cache.end())
 					it = g_cache.emplace(key, scanColumn(i0 + di, k0 + dk, job.band)).first;
+				else if (job.rescan)
+					it->second = scanColumn(i0 + di, k0 + dk, job.band);
 				g_work.out.cols[g_work.index] = it->second;
 				++g_work.index;
 				continue;
@@ -593,6 +645,11 @@ namespace sekicraft::collision
 			}
 			const int nextBand = g_area.band.id + 1;
 			g_doneCache.clear();
+			g_retry.clear();
+			{
+				std::lock_guard lock(g_mutex);
+				g_groundProbe = game::fromMc(p);
+			}
 			g_area = {};
 			g_area.active = true;
 			g_area.band = { nextBand, ry - kBelow, ry + kAbove };
@@ -626,12 +683,42 @@ namespace sekicraft::collision
 			std::lock_guard lock(g_mutex);
 			done.swap(g_done);
 		}
+		const unsigned long long now = GetTickCount64();
 		for (Done& d : done) {
 			if (d.job.band.id != g_area.band.id)
 				continue;
+			const std::pair<int, int> key{ d.job.rx, d.job.rz };
+			if (isEmpty(d)) {
+				Retry& r = g_retry[key];
+				if (r.tries < kEmptyRetries) {
+					++r.tries;
+					r.due = now + kEmptyRetryMs;
+				}
+			} else if (auto it = g_retry.find(key); it != g_retry.end()) {
+				if (it->second.tries > 0)
+					logf("collision: region column (%d, %d) has ground now (scan %d)", key.first, key.second, it->second.tries + 1);
+				g_retry.erase(it);
+			}
 			sendJob(link, d, epoch);
 			g_doneCache[{ d.job.rx, d.job.rz }] = std::move(d);
 		}
+		// Empty region columns near the player: scan again (Sekiro may have streamed them in since).
+		{
+			std::vector<Job> again;
+			for (auto& [key, r] : g_retry) {
+				if (r.due == 0 || now < r.due)
+					continue;
+				r.due = 0;  // set again if this scan is empty too
+				if (std::abs(key.first - g_area.cx) <= kRadius && std::abs(key.second - g_area.cz) <= kRadius)
+					again.push_back({ key.first, key.second, g_area.band, true });
+			}
+			if (!again.empty()) {
+				std::lock_guard lock(g_mutex);
+				for (const Job& j : again)
+					g_queue.push_back(j);
+			}
+		}
+
 		// Digs since last time: send those regions again from their cached scans.
 		for (const auto& key : g_dugChanged) {
 			auto it = g_doneCache.find(key);

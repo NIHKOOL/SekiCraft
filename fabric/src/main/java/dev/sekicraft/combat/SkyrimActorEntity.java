@@ -94,6 +94,7 @@ public class SkyrimActorEntity extends LivingEntity {
 		this.pendingDamage += dmg;
 		if (source.getDirectEntity() instanceof Projectile) {
 			this.pendingFlags |= Proto.HIT_PROJECTILE;
+			dev.sekicraft.SekiCraft.LOG.info("SekiCraft: projectile hit stand-in {} for {}", String.format("%08X", this.formId()), dmg);
 		}
 		this.pendingWeapon = weaponClass(source);
 		if (source.is(net.minecraft.tags.DamageTypeTags.IS_FIRE)) {

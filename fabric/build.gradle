@@ -24,7 +24,7 @@ loom {
 	runs {
 		client {
 			programArgs "--username", (System.getenv("SEKICRAFT_USERNAME") ?: "Wolf")
-			vmArgs "--enable-native-access=ALL-UNNAMED", "-Dsekicraft.quitWithSkyrim=false"
+			vmArgs "--enable-native-access=ALL-UNNAMED", "-Dsekicraft.quitWithSkyrim=" + (System.getenv("SEKICRAFT_QUIT_WITH_SEKIRO") ?: "false")
 		}
 	}
 

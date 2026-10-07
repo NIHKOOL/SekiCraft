@@ -221,7 +221,7 @@ namespace
 		game::Vec3 lastGround{};
 		bool haveLastGround = false;
 		ULONGLONG lastRescue = 0;
-		bool f6 = false, f7 = false, f8 = false, f9 = false, f10 = false;
+		bool f4 = false, f6 = false, f7 = false, f8 = false, f9 = false, f10 = false;
 		int lightPreset = 3;  // F6: off by default (scene lighting looked wrong in testing)
 		int cameraLag = 1;  // F7 cycles 0-2 (debug); 1 matches Sekiro
 		bool linked = false, wasInGame = false, haveFloor = false, haveFloorHeight = false;
@@ -311,6 +311,14 @@ namespace
 				else
 					logf("core: F8 ignored: ray casts unavailable");
 			}
+			if (pressed(VK_F4, f4)) {
+				if (haveMc) {
+					link.sendInput(proto::kInToggleCreative, 0, 0);
+					logf("core: F4 -> Minecraft switches Survival/Creative");
+				} else {
+					logf("core: F4 ignored: Minecraft isn't in its world yet");
+				}
+			}
 			if (pressed(VK_F6, f6)) {
 				// Block lighting presets: midGrey is the scene brightness that counts as normally lit.
 				static constexpr struct { bool on; float midGrey; const char* name; } kPresets[] = {
@@ -348,7 +356,10 @@ namespace
 						st.posZ = w.z;
 						++st.teleportSeq;
 						awaitingTeleport = true;
-						haveLastGround = false;
+						// Where Wolf stands counts as ground: falling far below it without ever landing
+						// (Sekiro's ground missing under Minecraft) puts the player back here.
+						lastGround = w;
+						haveLastGround = true;
 					}
 					lookYaw = game::yawToMc(wolf.theta);
 					lookPitch = 0;
@@ -476,7 +487,7 @@ namespace
 					if (mc.flags & proto::kMcOnGround) {
 						lastGround = { float(mc.x), float(mc.y), float(mc.z) };
 						haveLastGround = true;
-					} else if (haveLastGround && mc.y < lastGround.y - 30.0 && now - lastRescue > 1000) {
+					} else if (haveLastGround && !(mc.flags & proto::kMcFlying) && mc.y < lastGround.y - 30.0 && now - lastRescue > 1000) {
 						st.posX = lastGround.x;
 						st.posY = lastGround.y + 0.02;
 						st.posZ = lastGround.z;

@@ -69,6 +69,13 @@ public final class InputBridge {
 					minecraft.gui.setScreen(new PauseScreen(true));
 				}
 			}
+			case Proto.IN_TOGGLE_CREATIVE -> {
+				// The mirror world allows commands; the server's own feedback says what changed.
+				if (minecraft.player != null && minecraft.gameMode != null) {
+					boolean creative = minecraft.gameMode.getPlayerMode() == net.minecraft.world.level.GameType.CREATIVE;
+					minecraft.player.connection.sendCommand(creative ? "gamemode survival" : "gamemode creative");
+				}
+			}
 			default -> {
 			}
 		}

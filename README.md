@@ -21,7 +21,10 @@ Two mods connect them through shared memory: a DLL inside Sekiro and a Fabric mo
 | Blocks | Place and break blocks on Sekiro's ground. They're drawn in Sekiro's 3D view with Minecraft's textures and hidden behind Sekiro's walls, rocks and trees. Not yet lit by Sekiro's light |
 | Entities | Dropped items, arrows, block cracks, the targeted block's outline, Minecraft mobs and particles, and your own body in third person (F5) |
 | Digging | Dig into Sekiro's ground: grass, dirt, then stone with ores. Holes are cut out of Sekiro's picture and you can climb down into them. Cliffs and walls dig approximately |
-| Combat | Hit Sekiro's enemies with Minecraft weapons (HP and posture). A hit on a broken posture is a deathblow, and bosses lose one life (red dot) per deathblow. Enemies' hits cost Minecraft hearts, in proportion to Wolf's health |
+| Combat | Hit Sekiro's enemies with Minecraft weapons and arrows (HP and posture). A hit on a broken posture is a deathblow, and bosses lose one life (red dot) per deathblow. Enemies' hits cost Minecraft hearts, in proportion to Wolf's health, and a shield blocks them |
+| Death | Dying in Minecraft kills Wolf too (Sekiro's own death and respawn); Sekiro's HUD is hidden while Minecraft has control |
+| Creative | **F4** switches between Survival and Creative: fly, instant breaking, the full item list with search |
+| One click | `Play SekiCraft.bat` starts Sekiro, which starts Minecraft; Minecraft saves and quits when Sekiro closes |
 
 **Planned:**
 - Sekiro's lighting on blocks
@@ -62,9 +65,10 @@ gradlew build
 
 ## Running
 
-1. Start Minecraft with the mod: `cd fabric` then `gradlew runClient`. Its window hides itself once Sekiro connects.
-2. Start Sekiro with `tools\launch-sekiro.bat`. This runs offline through me3.
-3. Load a save. When you can control Wolf, press **F10**.
+1. Double-click `Play SekiCraft.bat`. It starts Sekiro offline through me3, and Sekiro starts Minecraft in the background (about a minute the first time). Minecraft's window hides itself once it's linked.
+2. Load a save. When you can control Wolf, press **F10**.
+
+What Sekiro starts for Minecraft is set in `sekiro\build\sekicraft.ini`, written on the first run (from a source checkout: `gradlew runClient` in `fabric`). Leave `minecraft_command` empty to start Minecraft yourself.
 
 Logs: `sekiro\build\sekicraft.log` (Sekiro side) and the Gradle console or `fabric\run\logs` (Minecraft side).
 
@@ -74,7 +78,8 @@ Logs: `sekiro\build\sekicraft.log` (Sekiro side) and the Gradle console or `fabr
 |---|---|
 | **F10** | Minecraft controls |
 | **F9** / **Esc** | Back to Sekiro controls. Esc closes an open Minecraft screen first |
-| Minecraft keys | WASD, Space, Shift, Ctrl, E (inventory), 1–9 and mouse wheel (hotbar), mouse buttons |
+| **F4** | Survival / Creative |
+| Minecraft keys | WASD, Space, Shift, Ctrl, E (inventory), T (chat), 1–9 and mouse wheel (hotbar), mouse buttons. Typing works in Minecraft's text boxes (chat, creative search) |
 | **F8** | Debug: logs every collision surface through Wolf's position |
 | **F7** | Debug: cycles how many frames the block camera lags Sekiro's (0–2; 1 is right) |
 | **F6** | Experimental: cycles block lighting from Sekiro's picture (normal, darker, brighter, off; off by default) |

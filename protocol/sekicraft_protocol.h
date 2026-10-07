@@ -184,6 +184,7 @@ namespace sekicraft::proto
 		kInReleaseAll = 6,   // release every held key/button (input focus left MC)
 		kInHurt = 7,         // Skyrim hit the player: code = HurtKind, a = Skyrim damage * 100, b = attacker FormID, c = HurtFlags
 		kInOpenMenu = 8,     // open Minecraft's pause/options menu
+		kInToggleCreative = 9,  // switch the player between Survival and Creative
 	};
 
 	enum HurtKind : std::uint16_t

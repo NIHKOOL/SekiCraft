@@ -39,6 +39,7 @@ public final class SkyClient {
 	private static Vec3 holdPos;
 	private static Vec3 unlinkedHold;
 	private static long holdSince;
+	private static long lastHoldLog;
 	private static long qpcFreq;
 	private static LocalPlayer eyePlayer;
 	private static float eyeSmoothed;
@@ -278,6 +279,14 @@ public final class SkyClient {
 			&& SkyCollision.isKnown(bx, by - SkyCollision.REGION_SIZE, bz);
 		// Release once there is actual ground below (or after a timeout, e.g. when mid-air on purpose).
 		boolean ready = known && (SkyCollision.hasSolidBelow(bx, by, bz, 12) || System.currentTimeMillis() - holdSince > 6000);
+		long heldMs = System.currentTimeMillis() - holdSince;
+		if (!ready && heldMs > 3000 && System.currentTimeMillis() - lastHoldLog > 2000) {
+			lastHoldLog = System.currentTimeMillis();
+			SekiCraft.LOG.info("SekiCraft: holding the player at ({}, {}, {}) for {} s: region known below/at/8 below {}/{}/{}, solid below {}, {} regions known, sky in game {} loading {}",
+				bx, by, bz, heldMs / 1000, SkyCollision.isKnown(bx, by - 1, bz), SkyCollision.isKnown(bx, by, bz),
+				SkyCollision.isKnown(bx, by - SkyCollision.REGION_SIZE, bz), SkyCollision.hasSolidBelow(bx, by, bz, 12), SkyCollision.regionCount(),
+				sky.inGame(), sky.loading());
+		}
 		if (ready && sky.inGame() && !sky.loading()) {
 			// Skyrim's feet can sit a fraction of a voxel inside our ground layer. Minecraft's
 			// collision never pushes you out of a shape, so you'd drop through: lift out first.

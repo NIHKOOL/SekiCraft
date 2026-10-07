@@ -42,6 +42,21 @@ public abstract class AbstractArrowMixin {
 	@Inject(method = "onHitEntity", at = @At("HEAD"))
 	private void sekicraft$rememberHit(EntityHitResult hitResult, CallbackInfo ci) {
 		this.sekicraft$hitAt = hitResult.getLocation();
+		AbstractArrow self = (AbstractArrow) (Object) this;
+		if (!self.level().isClientSide() && self.getOwner() instanceof net.minecraft.world.entity.player.Player) {
+			dev.sekicraft.SekiCraft.LOG.info("SekiCraft: arrow hit entity {} ({}) at {} speed {}", hitResult.getEntity().getClass().getSimpleName(),
+				hitResult.getEntity() instanceof SkyrimActorEntity a ? String.format("stand-in %08X", a.formId()) : "not a stand-in", hitResult.getLocation(),
+				String.format("%.2f", self.getDeltaMovement().length()));
+		}
+	}
+
+	@Inject(method = "onHitBlock", at = @At("HEAD"))
+	private void sekicraft$logBlockHit(BlockHitResult hitResult, CallbackInfo ci) {
+		AbstractArrow self = (AbstractArrow) (Object) this;
+		if (!self.level().isClientSide() && self.getOwner() instanceof net.minecraft.world.entity.player.Player) {
+			dev.sekicraft.SekiCraft.LOG.info("SekiCraft: arrow hit {} at {} (shot from {} blocks away)", hitResult instanceof SkyClip.SkyrimHitResult ? "Sekiro geometry" : "a block",
+				hitResult.getLocation(), self.getOwner() == null ? "?" : String.format("%.1f", self.getOwner().position().distanceTo(hitResult.getLocation())));
+		}
 	}
 
 	/**
