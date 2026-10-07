@@ -1,5 +1,6 @@
 #include "collision.h"
 
+#include "clip.h"
 #include "log.h"
 
 #include <windows.h>
@@ -45,6 +46,7 @@ namespace sekicraft::collision
 		{
 			std::array<float, kMaxHits> ys{};  // MC y of each surface, highest first
 			int n = 0;
+			std::uint32_t buried = 0;           // bit s: surface s is inside closed geometry (see scanColumn)
 
 			// Index of the surface closest to y within kMatchDy, or -1.
 			int match(float y) const
@@ -127,6 +129,32 @@ namespace sekicraft::collision
 		};
 		Area g_area;
 
+		// Dug blocks, as Minecraft reports them per 16^3 section (kRenDug): Sekiro's geometry in them
+		// is gone. Worker only.
+		struct DugSection
+		{
+			std::array<std::uint64_t, 64> bits{};  // bit x + 16z + 256y
+		};
+		std::unordered_map<long long, DugSection> g_dug;
+		std::set<std::pair<int, int>>             g_dugChanged;  // region columns to send again
+		unsigned                                  g_dugGeneration = 0;
+		// The last finished scan of each region column, so a dig re-sends without casting rays again.
+		std::map<std::pair<int, int>, Done>       g_doneCache;
+
+		long long sectionKey(int sx, int sy, int sz)
+		{
+			return (long long(sx & 0x3FFFFF) << 42) | (long long(sy & 0xFFFFF) << 22) | long long(sz & 0x3FFFFF);
+		}
+
+		bool isDug(int x, int y, int z)
+		{
+			auto it = g_dug.find(sectionKey(floorDiv(x, 16), floorDiv(y, 16), floorDiv(z, 16)));
+			if (it == g_dug.end())
+				return false;
+			const int bit = (x & 15) + 16 * (z & 15) + 256 * (y & 15);
+			return (it->second.bits[bit >> 6] >> (bit & 63)) & 1;
+		}
+
 		long long colKey(int i, int k) { return (long long(i) << 32) ^ (long long(k) & 0xFFFFFFFFll); }
 		float colX(int i) { return (float(i) + 0.5f) * kSpacing; }
 		float colZ(int k) { return (float(k) + 0.5f) * kSpacing; }
@@ -161,6 +189,27 @@ namespace sekicraft::collision
 			return true;
 		}
 
+		// How many surfaces a segment passes through (two-sided: restart a hair past each hit).
+		constexpr float kParityReach = 24.0f;
+		int crossings(game::Vec3 start, game::Vec3 delta)
+		{
+			const float len = std::sqrt(delta.x * delta.x + delta.y * delta.y + delta.z * delta.z);
+			const game::Vec3 dir{ delta.x / len, delta.y / len, delta.z / len };
+			float travelled = 0;
+			int n = 0;
+			for (; n < 16 && travelled < len - 0.05f;) {
+				const float left = len - travelled;
+				game::RayHit h{};
+				if (!cast(start, { dir.x * left, dir.y * left, dir.z * left }, h))
+					break;
+				const float step = h.fraction * left + 0.02f;
+				travelled += step;
+				start = { start.x + dir.x * step, start.y + dir.y * step, start.z + dir.z * step };
+				++n;
+			}
+			return n;
+		}
+
 		// Every surface in column (i, k) inside the band, top down. Surfaces are two-sided, so the
 		// ray just restarts a hair below each hit.
 		Column scanColumn(int i, int k, const Band& band)
@@ -177,6 +226,18 @@ namespace sekicraft::collision
 					break;  // not a sane hit below the start
 				c.ys[c.n++] = h.pos.y;
 				y = h.pos.y - 0.02f;
+			}
+			// Which surfaces are inside closed geometry (ground running on under a cliff, a castle
+			// wall's footing)? Surfaces are two-sided, so ask by parity: a long ray from just above
+			// the surface crosses a closed shape's faces an odd number of times when it starts inside
+			// it. Odd both ways (east, north): buried. Buried surfaces aren't ground and grow no walls
+			// (walls seen from inside rock would face the wrong way: digging would raise blocks in
+			// the open air in front of the cliff).
+			for (int s = 0; s < c.n; ++s) {
+				const float above = s > 0 ? c.ys[s - 1] : INFINITY;
+				const float py = std::min(c.ys[s] + 0.5f, (c.ys[s] + above) * 0.5f);
+				if ((crossings({ x, py, z }, { kParityReach, 0, 0 }) & 1) && (crossings({ x, py, z }, { 0, 0, -kParityReach }) & 1))
+					c.buried |= 1u << s;
 			}
 			return c;
 		}
@@ -196,10 +257,14 @@ namespace sekicraft::collision
 			const bool  alongX = fi != ti;
 			const float fx = colX(fi), fz = colZ(fk), tx = colX(ti), tz = colZ(tk);
 			for (int s = 0; s < from.n; ++s) {
+				if ((from.buried >> s) & 1)
+					continue;  // inside rock: what it would see are the rock's faces from behind
 				const float floorY = from.ys[s];
 				const float ceiling = s > 0 ? from.ys[s - 1] : INFINITY;
-				float top = -INFINITY, wallAt = 0;
-				int hits = 0;
+				// Where the wall is at each height: (height, position along the ray's axis).
+				std::array<std::pair<float, float>, 32> profile{};
+				int samples = 0;
+				float top = -INFINITY;
 				for (float dh : kWallHeights) {
 					const float h = floorY + dh;
 					if (h > ceiling - 0.05f)
@@ -209,18 +274,49 @@ namespace sekicraft::collision
 						continue;
 					const float above = to.lowestAbove(h - 0.05f);
 					top = std::max(top, std::min(std::isnan(above) ? floorY + kWallTopDefault : above, ceiling));
-					wallAt += alongX ? hit.pos.x : hit.pos.z;
-					++hits;
+					profile[samples++] = { h, alongX ? hit.pos.x : hit.pos.z };
 				}
-				if (!hits || top <= floorY + 0.05f)
+				if (!samples || top <= floorY + 0.05f)
 					continue;
-				wallAt /= float(hits);
-				if (alongX) {
-					const float z0 = float(fk) * kSpacing, z1 = z0 + kSpacing;
-					addQuad(out, { wallAt, floorY, z0 }, { wallAt, top, z0 }, { wallAt, top, z1 }, { wallAt, floorY, z1 });
-				} else {
-					const float x0 = float(fi) * kSpacing, x1 = x0 + kSpacing;
-					addQuad(out, { x0, floorY, wallAt }, { x0, top, wallAt }, { x1, top, wallAt }, { x1, floorY, wallAt });
+				// A tall wall: follow it up every 0.5 (castle walls and cliffs lean back), reaching
+				// further than the next column as it recedes. Stops where it ends or turns away.
+				const float dirX = (tx - fx) / kSpacing, dirZ = (tz - fz) / kSpacing;
+				for (float h = floorY + 2.0f; h < std::min({ top, ceiling, floorY + 12.0f }) - 0.05f && samples < int(profile.size()); h += 0.5f) {
+					game::RayHit hit{};
+					if (!cast({ fx, h, fz }, { dirX * 2.0f, 0, dirZ * 2.0f }, hit)) {
+						top = h - 0.25f;
+						break;
+					}
+					profile[samples++] = { h, alongX ? hit.pos.x : hit.pos.z };
+				}
+				// Rock: diggable stone, facing back toward `from` (the open side the rays came from).
+				// Slanted pieces between samples; the first and last stretch to the floor and the top.
+				const std::size_t first = out.size();
+				auto piece = [&](float y0, float a0, float y1, float a1) {
+					if (y1 <= y0 + 0.01f)
+						return;
+					if (alongX) {
+						const float z0 = float(fk) * kSpacing, z1 = z0 + kSpacing;
+						addQuad(out, { a0, y0, z0 }, { a1, y1, z0 }, { a1, y1, z1 }, { a0, y0, z1 });
+					} else {
+						const float x0 = float(fi) * kSpacing, x1 = x0 + kSpacing;
+						addQuad(out, { x0, y0, a0 }, { x0, y1, a1 }, { x1, y1, a1 }, { x1, y0, a0 });
+					}
+				};
+				piece(floorY, profile[0].second, profile[0].first, profile[0].second);
+				for (int i = 0; i + 1 < samples; ++i)
+					piece(profile[i].first, profile[i].second, profile[i + 1].first, profile[i + 1].second);
+				piece(profile[samples - 1].first, profile[samples - 1].second, top, profile[samples - 1].second);
+				const float openX = fx - tx, openZ = fz - tz;
+				for (std::size_t i = first; i < out.size(); ++i) {
+					float* v = out[i].v;
+					const float nx = (v[4] - v[1]) * (v[8] - v[2]) - (v[5] - v[2]) * (v[7] - v[1]);
+					const float nz = (v[3] - v[0]) * (v[7] - v[1]) - (v[4] - v[1]) * (v[6] - v[0]);
+					if (nx * openX + nz * openZ < 0) {
+						for (int k = 0; k < 3; ++k)
+							std::swap(v[3 + k], v[6 + k]);
+					}
+					out[i].flags = proto::kTriDiggable | (std::uint32_t(proto::kDigStone) << proto::kTriMaterialShift);
 				}
 			}
 		}
@@ -248,9 +344,25 @@ namespace sekicraft::collision
 							if (!seen.insert(m).second)
 								continue;
 							auto p = [&](int c) { return point(cdi[c], cdk[c], corner[c]->ys[m[c]]); };
+							// Ground (a surface with room above it, so solid below): diggable land, wound to
+							// face up (out of the solid side). Anything else (ceilings, thin layers): not.
+							const int seedAbove = s > 0 ? s - 1 : -1;
+							const bool ground = !((corner[seedCorner]->buried >> s) & 1) && (seedAbove < 0 || corner[seedCorner]->ys[seedAbove] - y > 1.0f);
 							auto tri = [&](int c0, int c1, int c2) {
-								const game::Vec3 a = p(c0), b = p(c1), e = p(c2);
-								out.push_back({ { a.x, a.y, a.z, b.x, b.y, b.z, e.x, e.y, e.z }, 0 });
+								game::Vec3 a = p(c0), b = p(c1), e = p(c2);
+								const float nx = (b.y - a.y) * (e.z - a.z) - (b.z - a.z) * (e.y - a.y);
+								const float ny = (b.z - a.z) * (e.x - a.x) - (b.x - a.x) * (e.z - a.z);
+								const float nz = (b.x - a.x) * (e.y - a.y) - (b.y - a.y) * (e.x - a.x);
+								std::uint32_t flags = 0;
+								if (ground) {
+									if (ny < 0)
+										std::swap(b, e);
+									const float len = std::sqrt(nx * nx + ny * ny + nz * nz);
+									const bool flat = len > 0 && std::abs(ny) / len > 0.7f;
+									flags = proto::kTriDiggable | proto::kTriTerrain |
+									        (std::uint32_t(flat ? proto::kDigGrass : proto::kDigDirt) << proto::kTriMaterialShift);
+								}
+								out.push_back({ { a.x, a.y, a.z, b.x, b.y, b.z, e.x, e.y, e.z }, flags });
 							};
 							const bool A = m[0] >= 0, B = m[1] >= 0, C = m[2] >= 0, D = m[3] >= 0;
 							if (A && B && D)
@@ -275,8 +387,41 @@ namespace sekicraft::collision
 
 		void sendJob(GameLink& link, const Done& d, std::uint32_t epoch)
 		{
-			std::vector<proto::ColTri> tris = d.walls;
-			buildSurfaces(d, tris);
+			std::vector<proto::ColTri> built = d.walls;
+			buildSurfaces(d, built);
+
+			// Dug blocks: Sekiro's geometry in them is gone. A diggable triangle touching one is cut
+			// (what's outside every dug block stays), and its original goes along as a ghost, so
+			// Minecraft still knows what's solid behind it.
+			std::vector<proto::ColTri> tris;
+			tris.reserve(built.size());
+			std::vector<Clip::Cube> cubes;
+			std::vector<Clip::Poly> pieces;
+			for (const proto::ColTri& t : built) {
+				cubes.clear();
+				if ((t.flags & proto::kTriDiggable) && !g_dug.empty()) {
+					const int x0 = int(std::floor(std::min({ t.v[0], t.v[3], t.v[6] }))), x1 = int(std::floor(std::max({ t.v[0], t.v[3], t.v[6] })));
+					const int y0 = int(std::floor(std::min({ t.v[1], t.v[4], t.v[7] }) - 0.001f)), y1 = int(std::floor(std::max({ t.v[1], t.v[4], t.v[7] })));
+					const int z0 = int(std::floor(std::min({ t.v[2], t.v[5], t.v[8] }))), z1 = int(std::floor(std::max({ t.v[2], t.v[5], t.v[8] })));
+					for (int x = x0; x <= x1; ++x)
+						for (int y = y0; y <= y1; ++y)
+							for (int z = z0; z <= z1; ++z)
+								if (isDug(x, y, z))
+									cubes.push_back({ x, y, z });
+				}
+				if (cubes.empty()) {
+					tris.push_back(t);
+					continue;
+				}
+				tris.push_back({ { t.v[0], t.v[1], t.v[2], t.v[3], t.v[4], t.v[5], t.v[6], t.v[7], t.v[8] }, t.flags | proto::kTriGhost });
+				pieces.clear();
+				Clip::Subtract(Clip::FromTriangle(t.v, t.v + 3, t.v + 6), cubes, pieces);
+				for (const auto& piece : pieces)
+					for (std::size_t v = 1; v + 1 < piece.size(); ++v)
+						tris.push_back({ { piece[0].p[0], piece[0].p[1], piece[0].p[2], piece[v].p[0], piece[v].p[1], piece[v].p[2], piece[v + 1].p[0],
+										   piece[v + 1].p[1], piece[v + 1].p[2] },
+							t.flags });
+			}
 
 			const int x0 = d.job.rx * kRegion, z0 = d.job.rz * kRegion;
 			std::string buf;
@@ -311,7 +456,7 @@ namespace sekicraft::collision
 							const int l0 = int(std::floor((c.ys[s] - kSlab) * 8.0f)), l1 = int(std::floor(c.ys[s] * 8.0f - 1e-3f));
 							for (int l = l0; l <= l1; ++l) {
 								const int by = floorDiv(l, 8);
-								if (by < y0 || by >= y0 + kRegion)
+								if (by < y0 || by >= y0 + kRegion || isDug(bx, by, bz))
 									continue;
 								auto& b = blocks[{ bx, by, bz }];
 								b.x = bx;
@@ -447,6 +592,7 @@ namespace sekicraft::collision
 				g_done.clear();
 			}
 			const int nextBand = g_area.band.id + 1;
+			g_doneCache.clear();
 			g_area = {};
 			g_area.active = true;
 			g_area.band = { nextBand, ry - kBelow, ry + kAbove };
@@ -480,9 +626,79 @@ namespace sekicraft::collision
 			std::lock_guard lock(g_mutex);
 			done.swap(g_done);
 		}
-		for (const Done& d : done)
-			if (d.job.band.id == g_area.band.id)
-				sendJob(link, d, epoch);
+		for (Done& d : done) {
+			if (d.job.band.id != g_area.band.id)
+				continue;
+			sendJob(link, d, epoch);
+			g_doneCache[{ d.job.rx, d.job.rz }] = std::move(d);
+		}
+		// Digs since last time: send those regions again from their cached scans.
+		for (const auto& key : g_dugChanged) {
+			auto it = g_doneCache.find(key);
+			if (it != g_doneCache.end() && it->second.job.band.id == g_area.band.id)
+				sendJob(link, it->second, epoch);
+		}
+		g_dugChanged.clear();
+	}
+
+	void onDug(const std::uint8_t* p, std::uint32_t bytes)
+	{
+		if (bytes < sizeof(proto::RenDug))
+			return;
+		proto::RenDug h;
+		std::memcpy(&h, p, sizeof(h));
+		const long long key = sectionKey(h.sx, h.sy, h.sz);
+		if (h.count == 0 || bytes < sizeof(h) + 512) {
+			g_dug.erase(key);
+		} else {
+			DugSection& d = g_dug[key];
+			std::memcpy(d.bits.data(), p + sizeof(h), 512);
+		}
+		// The region columns this section overlaps (2x2 of them: sections are 16, regions 8).
+		for (int rx = h.sx * 2; rx <= h.sx * 2 + 1; ++rx)
+			for (int rz = h.sz * 2; rz <= h.sz * 2 + 1; ++rz)
+				g_dugChanged.insert({ rx, rz });
+		++g_dugGeneration;
+		static int logged = 0;
+		if (logged++ < 20)
+			logf("collision: Minecraft dug %u blocks in section (%d, %d, %d)", h.count, h.sx, h.sy, h.sz);
+	}
+
+	bool dugAt(int x, int y, int z)
+	{
+		return isDug(x, y, z);
+	}
+
+	unsigned dugGeneration()
+	{
+		return g_dugGeneration;
+	}
+
+	void dugWindow(int ox, int oy, int oz, int n, std::vector<std::uint8_t>& out)
+	{
+		out.assign(std::size_t(n) * n * n, 0);
+		for (const auto& [key, d] : g_dug) {
+			// Decode the section from its key (see sectionKey).
+			const auto sext = [](long long v, int bits) { return int((v << (64 - bits)) >> (64 - bits)); };
+			const int sx = sext(key >> 42, 22), sy = sext((key >> 22) & 0xFFFFF, 20), sz = sext(key & 0x3FFFFF, 22);
+			if (sx * 16 + 16 <= ox || sx * 16 >= ox + n || sy * 16 + 16 <= oy || sy * 16 >= oy + n || sz * 16 + 16 <= oz || sz * 16 >= oz + n)
+				continue;
+			for (int bit = 0; bit < 4096; ++bit) {
+				if (!((d.bits[bit >> 6] >> (bit & 63)) & 1))
+					continue;
+				const int x = sx * 16 + (bit & 15) - ox, z = sz * 16 + ((bit >> 4) & 15) - oz, y = sy * 16 + (bit >> 8) - oy;
+				if (x >= 0 && y >= 0 && z >= 0 && x < n && y < n && z < n)
+					out[std::size_t(x) + std::size_t(n) * (std::size_t(y) + std::size_t(n) * std::size_t(z))] = 1;
+			}
+		}
+	}
+
+	void clearDug()
+	{
+		++g_dugGeneration;
+		g_dug.clear();
+		for (const auto& [key, d] : g_doneCache)
+			g_dugChanged.insert(key);
 	}
 
 	void reset()

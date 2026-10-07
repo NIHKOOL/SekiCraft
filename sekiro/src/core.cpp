@@ -129,9 +129,38 @@ namespace
 
 	}
 
+	// Leaving Minecraft control inside a dug hole: in Sekiro's own world the hole isn't there, so
+	// Wolf would be inside solid ground and drop through it. Put him on the surface above.
+	std::atomic<bool> g_liftRequested{ false };
+
+	void liftOutOfHole()
+	{
+		game::PlayerState wolf{};
+		if (!game::readPlayer(wolf))
+			return;
+		// Every surface above his feet (up to 40 m); the lowest one is the ground over the hole.
+		float best = INFINITY;
+		game::Vec3 start{ wolf.pos.x, wolf.pos.y + 40.0f, wolf.pos.z };
+		for (int i = 0; i < 16; ++i) {
+			game::RayHit hit{};
+			const float down = start.y - wolf.pos.y;
+			if (down < 0.05f || !game::castRay(start, { 0, -down, 0 }, hit))
+				break;
+			if (hit.pos.y > wolf.pos.y + 0.2f)
+				best = std::min(best, hit.pos.y);
+			start = { start.x, hit.pos.y - 0.02f, start.z };
+		}
+		if (std::isfinite(best)) {
+			game::writePlayerPos({ wolf.pos.x, best + 0.05f, wolf.pos.z });
+			logf("core: Wolf lifted out of a dug hole: %.2f -> %.2f", wolf.pos.y, best + 0.05f);
+		}
+	}
+
 	void onGameThreadTick()
 	{
 		applyDrive();
+		if (g_liftRequested.exchange(false))
+			liftOutOfHole();
 		bool minecraftDrives;
 		{
 			std::lock_guard lock(g_driveMutex);
@@ -206,6 +235,16 @@ namespace
 		auto toSekiro = [&](const char* why) {
 			if (mode == Mode::kSekiro)
 				return;
+			{
+				// Standing in a dug hole? (Minecraft's feet block, or the one under them.)
+				game::PlayerState w{};
+				if (game::readPlayer(w)) {
+					const game::Vec3 f = game::toMc(w.pos);
+					const int bx = int(std::floor(f.x)), by = int(std::floor(f.y + 0.01f)), bz = int(std::floor(f.z));
+					if (collision::dugAt(bx, by, bz) || collision::dugAt(bx, by - 1, bz))
+						g_liftRequested = true;
+				}
+			}
 			mode = Mode::kSekiro;
 			input::setRouting(false);
 			{
@@ -366,6 +405,23 @@ namespace
 				if (game::castRayReady())
 					collision::update(link, true, m, st.collisionEpoch);
 				combat::update(link, mode == Mode::kMinecraft);
+
+				// The dug blocks around the player, for cutting holes into Sekiro's picture.
+				{
+					static unsigned sentGeneration = ~0u;
+					static int origin[3] = { 1 << 30, 0, 0 };
+					const int px = int(std::floor(m.x)), py = int(std::floor(m.y)), pz = int(std::floor(m.z));
+					const bool moved = std::abs(px - (origin[0] + 32)) > 16 || std::abs(py - (origin[1] + 32)) > 16 || std::abs(pz - (origin[2] + 32)) > 16;
+					if (collision::dugGeneration() != sentGeneration || moved) {
+						sentGeneration = collision::dugGeneration();
+						origin[0] = px - 32;
+						origin[1] = py - 32;
+						origin[2] = pz - 32;
+						std::vector<std::uint8_t> cells;
+						collision::dugWindow(origin[0], origin[1], origin[2], 64, cells);
+						world::setDugWindow(origin, std::move(cells));
+					}
+				}
 
 				// A Minecraft hit on a staggered enemy: the deathblow (one life off, or dead), done in
 				// memory right away. (Letting Sekiro play its own deathblow animation was tried; it isn't

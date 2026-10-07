@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 struct ID3D11Device;
 struct ID3D11DeviceContext;
@@ -31,6 +32,10 @@ namespace sekicraft::world
 	// Worker thread: this frame's world entities (arrows, dropped items, cracks, the targeted block's
 	// outline).
 	void setWorldEntities(const proto::WorldEntities& entities);
+
+	// Worker thread: dug blocks around the player (64^3 from origin, Minecraft coords; see
+	// collision::dugWindow). Sekiro's ground is cut away where they are.
+	void setDugWindow(const int origin[3], std::vector<std::uint8_t>&& cells);
 
 	// Game thread, with each camera write: where the Minecraft player's feet are (Minecraft coords).
 	void setDriveFeet(const float feet[3]);

@@ -15,6 +15,7 @@
 #include "sekicraft_link.h"
 
 #include <string>
+#include <vector>
 
 namespace sekicraft::collision
 {
@@ -25,6 +26,20 @@ namespace sekicraft::collision
 	// finished. epoch is SkyState::collisionEpoch; it bumps (and Minecraft drops everything) when
 	// the player teleports or the world changes.
 	void update(GameLink& link, bool inGame, game::Vec3 playerMc, std::uint32_t& epoch);
+
+	// Worker thread: Minecraft's dug blocks for one section (render ring kRenDug), and "everything
+	// is being sent again" (kRenClearAll). Sekiro's geometry in a dug block is cut out of what
+	// Minecraft collides with.
+	void onDug(const std::uint8_t* payload, std::uint32_t bytes);
+	void clearDug();
+
+	// Changes whenever the dug blocks do. Worker thread.
+	unsigned dugGeneration();
+	// Is this Minecraft block dug? Worker thread.
+	bool dugAt(int x, int y, int z);
+	// Worker thread: n x n x n bytes, 1 where the block at origin + (x, y, z) is dug, laid out
+	// x + n * (y + n * z) (a Texture3D's own layout).
+	void dugWindow(int ox, int oy, int oz, int n, std::vector<std::uint8_t>& out);
 
 	// Forget everything (e.g. the core is about to unload).
 	void reset();

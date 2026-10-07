@@ -20,11 +20,11 @@ Two mods connect them through shared memory: a DLL inside Sekiro and a Fabric mo
 | HUD | Minecraft's hotbar, hearts, hunger, crosshair, hand and inventory drawn over Sekiro. Clicking, scrolling and moving items work |
 | Blocks | Place and break blocks on Sekiro's ground. They're drawn in Sekiro's 3D view with Minecraft's textures and hidden behind Sekiro's walls, rocks and trees. Not yet lit by Sekiro's light |
 | Entities | Dropped items, arrows, block cracks, the targeted block's outline, Minecraft mobs and particles, and your own body in third person (F5) |
+| Digging | Dig into Sekiro's ground: grass, dirt, then stone with ores. Holes are cut out of Sekiro's picture and you can climb down into them. Cliffs and walls dig approximately |
 | Combat | Hit Sekiro's enemies with Minecraft weapons (HP and posture). A hit on a broken posture is a deathblow, and bosses lose one life (red dot) per deathblow. Enemies' hits cost Minecraft hearts, in proportion to Wolf's health |
 
 **Planned:**
 - Sekiro's lighting on blocks
-- digging into Sekiro's ground
 
 See [docs/DESIGN.md](docs/DESIGN.md) for how it works, the memory addresses used, and the roadmap.
 

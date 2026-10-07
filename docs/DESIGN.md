@@ -239,6 +239,26 @@ Skyrim's ground is a heightmap that SkyCraft can deform. Sekiro's ground is **st
    - Enemies falling into holes. Sekiro AI follows navmesh; we can still kill an enemy that would fall in.
    - Holes through walls of buildings.
 
+### 7.1 Digging as built (Phase 7)
+
+**Collision** (`collision.cpp`):
+- Ground surfaces (with room above) go out as diggable land: grass when flat, else dirt, wound to face up.
+- Horizontal-ray walls go out as diggable stone facing the open side. Tall walls are followed every 0.5 m up to 12 m as slanted pieces, because castle walls and cliffs lean back.
+- Surfaces inside closed geometry are found by **ray parity** (odd crossings both east and north: buried). They're neither ground nor wall sources; walls seen from inside rock faced the wrong way and made Minecraft fill the open air in front of cliffs.
+- Dug blocks arrive per section as `kRenDug`. Diggable triangles touching one are cut with SkyCraft's `Clip.h` (MIT), with the original kept as a ghost, and the region is resent from the cached scan.
+
+**Picture** (`world.cpp`):
+- The worker keeps a 64³ dug-block window around the player, uploaded as an `R8_UINT` 3D texture.
+- The depth-copy pass rebuilds each pixel's position (inverse view-projection) and writes "nothing" where it lies in a dug block, so Minecraft's revealed blocks and dig walls show there.
+- Because Sekiro draws its ground and walls a few cm in front of its collision, a point also counts when the block 0.3 below it, or 0.35 further along the view ray, is dug. Without this, holes stayed covered when seen from the side.
+
+**Leaving Minecraft control in a hole** lifts Wolf onto the original surface above him; Sekiro's own world has no hole.
+
+**Known limits:**
+- Cliff and wall digs are only as good as the ray-sampled walls, so revealed stone can still stand slightly proud of bumpy walls.
+- Dig-wall tops follow the collision surface, not the visible one.
+- Sekiro's NPCs don't fall into holes.
+
 ## 8. Phases
 
 Each phase ends in something you can see working.
@@ -252,7 +272,7 @@ Each phase ends in something you can see working.
 | 4 ✅ | **Overlay** | MC hotbar, hearts, inventory and hand drawn in Sekiro |
 | 5 ✅ | **Blocks and entities** (Sekiro lighting still to do) | Place and break blocks on Sekiro surfaces, depth-correct |
 | 6 ◐ | **Combat** (fighting, deaths, deathblows done; shields to confirm, boss sizes) | Fight Ashina soldiers with MC weapons; they hit back; posture and deathblows |
-| 7 | **Digging** | Dig holes into Sekiro's ground with correct drops (§7) |
+| 7 ◐ | **Digging** (ground works; cliffs and walls approximate) | Dig holes into Sekiro's ground with correct drops (§7) |
 | 8 | **Polish** | Idol warps across dimensions, save snapshots, resurrection ↔ MC death, auto-launch |
 
 ## 9. Risks

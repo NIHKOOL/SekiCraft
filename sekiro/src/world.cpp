@@ -1,5 +1,6 @@
 #include "world.h"
 
+#include "collision.h"
 #include "log.h"
 #include "sekicraft_protocol.h"
 
@@ -69,6 +70,9 @@ namespace sekicraft::world
 		std::vector<PendingTexture> g_textures;
 		std::shared_ptr<Batches>    g_scene, g_avatar;   // latest frame of each
 		proto::WorldEntities        g_entities{};
+		bool                        g_dugPending = false;   // a new dug window to upload
+		int                         g_dugOrigin[3] = {};
+		std::vector<std::uint8_t>   g_dugCells;
 
 
 		// ---- render thread ----
@@ -99,6 +103,10 @@ namespace sekicraft::world
 		ID3D11PixelShader*        r_psCopy = nullptr;
 		ID3D11DepthStencilState*  r_depthCopy = nullptr;
 		ID3D11BlendState*         r_noColor = nullptr;
+		ID3D11Texture3D*          r_dugTex = nullptr;   // 64^3 dug blocks around the player
+		ID3D11ShaderResourceView* r_dugSrv = nullptr;
+		int                       r_dugOrigin[3] = {};
+		bool                      r_haveDug = false;
 		ID3D11InputLayout*        r_layout = nullptr;
 		ID3D11Buffer*             r_frameCb = nullptr;
 		ID3D11Buffer*             r_sectionCb = nullptr;
@@ -131,6 +139,9 @@ namespace sekicraft::world
 			float viewport[2];
 			float midGrey;       // scene luminance that counts as "normally lit" (linear)
 			float pad;
+			float invViewProj[16];  // back from the screen to Sekiro's world (dug-hole mask)
+			float camPos[4];        // Sekiro coords
+			int   dugOrigin[4];     // Minecraft block at dug-window (0, 0, 0); w = 1 when there is one
 		};
 
 		struct alignas(16) SectionCb
@@ -153,6 +164,7 @@ cbuffer Frame : register(b0) {
 	row_major float4x4 viewProj;
 	float renderPass; float localMip; float globalMip; float sceneLight;
 	float2 viewport; float midGrey; float pad0;
+	row_major float4x4 invViewProj; float4 camPos; int4 dugOrigin;
 };
 cbuffer Section : register(b1) { float4 origin; float forceTranslucent; float3 pad1; };
 Texture2D atlas : register(t0);
@@ -181,7 +193,35 @@ VSOut VSMain(VSIn i) {
 // Sekiro's scene depth copied into ours: both use the same reversed, infinite-far projection.
 Texture2D<float> sceneDepth : register(t1);
 float4 VSCopy(uint id : SV_VertexID) : SV_Position { float2 uv = float2((id << 1) & 2, id & 2); return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); }
-float PSCopy(float4 pos : SV_Position) : SV_Depth { return sceneDepth.Load(int3(pos.xy, 0)); }
+// Dug blocks around the player (1 = dug): Sekiro's geometry inside one is gone, so its depth
+// there is replaced by "nothing" and Minecraft's walls and revealed blocks behind show instead.
+Texture3D<uint> dugCells : register(t3);
+float PSCopy(float4 pos : SV_Position) : SV_Depth {
+	float d = sceneDepth.Load(int3(pos.xy, 0));
+	if (d > 0 && dugOrigin.w != 0) {
+		float2 ndc = float2(pos.x / viewport.x * 2 - 1, 1 - pos.y / viewport.y * 2);
+		float4 w = mul(float4(ndc, d, 1), invViewProj);
+		float3 p = w.xyz / w.w;
+		p += normalize(p - camPos.xyz) * 0.03;   // just behind the surface: inside what it bounds
+		float3 mc = float3(p.x, p.y, -p.z);       // Minecraft coords
+		// The block the point is in, and the one 0.3 below it: Sekiro draws its ground a few cm
+		// above its collision (which decides what's dug), so the visible surface of a dug block
+		// sits just over it. Without this, holes stay covered seen from the side and their walls
+		// don't reach the visible ground.
+		// Walls the same way, sideways: a wall's visible stones stand out in front of its collision,
+		// so also look 0.35 further along the view ray, behind the visible surface.
+		float3 view = normalize(p - camPos.xyz);
+		float3 behind = mc + float3(view.x, view.y, -view.z) * 0.35;
+		int3 cell = int3(floor(mc)) - dugOrigin.xyz;
+		int3 under = int3(floor(mc - float3(0, 0.3, 0))) - dugOrigin.xyz;
+		int3 deeper = int3(floor(behind)) - dugOrigin.xyz;
+		if ((all(cell >= 0) && all(cell < 64) && dugCells.Load(int4(cell, 0)) != 0) ||
+			(all(under >= 0) && all(under < 64) && dugCells.Load(int4(under, 0)) != 0) ||
+			(all(deeper >= 0) && all(deeper < 64) && dugCells.Load(int4(deeper, 0)) != 0))
+			return 0;
+	}
+	return d;
+}
 
 float  mcCurve(float b) { return b / (4.0 - 3.0 * b); }   // Minecraft's light brightness curve
 float3 toLinear(float3 c) { return pow(max(c, 0), 2.2); }
@@ -451,6 +491,61 @@ float4 PSMain(VSOut i) : SV_Target {
 			for (int r = 0; r < 4; ++r)
 				for (int c = 0; c < 4; ++c)
 					out[r * 4 + c] = a[r * 4 + 0] * b[0 * 4 + c] + a[r * 4 + 1] * b[1 * 4 + c] + a[r * 4 + 2] * b[2 * 4 + c] + a[r * 4 + 3] * b[3 * 4 + c];
+		}
+
+		// General 4x4 inverse (Gauss-Jordan); false when singular.
+		bool invert(const float* m, float* out)
+		{
+			double a[4][8];
+			for (int r = 0; r < 4; ++r)
+				for (int c = 0; c < 8; ++c)
+					a[r][c] = c < 4 ? m[r * 4 + c] : (c - 4 == r ? 1.0 : 0.0);
+			for (int c = 0; c < 4; ++c) {
+				int pivot = c;
+				for (int r = c + 1; r < 4; ++r)
+					if (std::abs(a[r][c]) > std::abs(a[pivot][c]))
+						pivot = r;
+				if (std::abs(a[pivot][c]) < 1e-12)
+					return false;
+				std::swap(a[c], a[pivot]);
+				const double k = 1.0 / a[c][c];
+				for (double& v : a[c])
+					v *= k;
+				for (int r = 0; r < 4; ++r) {
+					if (r == c)
+						continue;
+					const double f = a[r][c];
+					for (int k2 = 0; k2 < 8; ++k2)
+						a[r][k2] -= f * a[c][k2];
+				}
+			}
+			for (int r = 0; r < 4; ++r)
+				for (int c = 0; c < 4; ++c)
+					out[r * 4 + c] = float(a[r][c + 4]);
+			return true;
+		}
+
+		void uploadDug(ID3D11Device* device, ID3D11DeviceContext* ctx, const std::vector<std::uint8_t>& cells, const int origin[3])
+		{
+			constexpr UINT n = 64;
+			if (cells.size() != std::size_t(n) * n * n)
+				return;
+			if (!r_dugTex) {
+				D3D11_TEXTURE3D_DESC td{};
+				td.Width = td.Height = td.Depth = n;
+				td.MipLevels = 1;
+				td.Format = DXGI_FORMAT_R8_UINT;
+				td.Usage = D3D11_USAGE_DEFAULT;
+				td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+				if (FAILED(device->CreateTexture3D(&td, nullptr, &r_dugTex)) || FAILED(device->CreateShaderResourceView(r_dugTex, nullptr, &r_dugSrv))) {
+					logf("world: dug-hole texture unavailable");
+					release(r_dugTex);
+					return;
+				}
+			}
+			ctx->UpdateSubresource(r_dugTex, 0, nullptr, cells.data(), n, n * n);
+			std::memcpy(r_dugOrigin, origin, sizeof(r_dugOrigin));
+			r_haveDug = std::find(cells.begin(), cells.end(), std::uint8_t(1)) != cells.end();
 		}
 
 		void viewProjection(const game::CameraState& cam, float aspect, float* out)
@@ -734,6 +829,7 @@ float4 PSMain(VSOut i) : SV_Target {
 		g_bytesIn += bytes;
 		switch (type) {
 		case proto::kRenClearAll: {
+			collision::clearDug();
 			std::lock_guard lock(g_mutex);
 			g_clear = true;
 			g_sections.clear();
@@ -834,8 +930,11 @@ float4 PSMain(VSOut i) : SV_Target {
 			(type == proto::kRenScene ? g_scene : g_avatar) = std::move(b);
 			break;
 		}
+		case proto::kRenDug:
+			collision::onDug(p, bytes);
+			break;
 		default:
-			break;  // lights, ragdoll, dug blocks: later phases
+			break;  // lights, ragdoll: later phases
 		}
 	}
 
@@ -853,6 +952,9 @@ float4 PSMain(VSOut i) : SV_Target {
 		std::unordered_map<long long, std::shared_ptr<SectionMesh>> sections;
 		std::vector<PendingTexture> textures;
 		proto::WorldEntities entities;
+		std::vector<std::uint8_t> dugCells;
+		int dugOrigin[3] = {};
+		bool haveNewDug = false;
 		{
 			std::lock_guard lock(g_mutex);
 			clear = g_clear;
@@ -869,9 +971,17 @@ float4 PSMain(VSOut i) : SV_Target {
 			if (g_avatar)
 				r_avatar = std::move(g_avatar);
 			entities = g_entities;
+			if (g_dugPending) {
+				g_dugPending = false;
+				dugCells.swap(g_dugCells);
+				std::memcpy(dugOrigin, g_dugOrigin, sizeof(dugOrigin));
+				haveNewDug = true;
+			}
 		}
 		for (const PendingTexture& t : textures)
 			uploadTexture(device, t);
+		if (haveNewDug)
+			uploadDug(device, ctx, dugCells, dugOrigin);
 		if (clear) {
 			for (auto& [k, s] : r_sections)
 				freeSection(s);
@@ -938,6 +1048,22 @@ float4 PSMain(VSOut i) : SV_Target {
 		frame.viewport[0] = float(width);
 		frame.viewport[1] = float(height);
 		frame.midGrey = g_midGrey;
+		if (!invert(frame.viewProj, frame.invViewProj))
+			std::memset(frame.invViewProj, 0, sizeof(frame.invViewProj));
+		frame.camPos[0] = cam.world[12];
+		frame.camPos[1] = cam.world[13];
+		frame.camPos[2] = cam.world[14];
+		frame.dugOrigin[0] = r_dugOrigin[0];
+		frame.dugOrigin[1] = r_dugOrigin[1];
+		frame.dugOrigin[2] = r_dugOrigin[2];
+		frame.dugOrigin[3] = r_haveDug && r_dugSrv ? 1 : 0;
+		{
+			D3D11_MAPPED_SUBRESOURCE m{};
+			if (SUCCEEDED(ctx->Map(r_frameCb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+				std::memcpy(m.pData, &frame, sizeof(frame));
+				ctx->Unmap(r_frameCb, 0);
+			}
+		}
 
 		const D3D11_VIEWPORT vp{ 0, 0, float(width), float(height), 0, 1 };
 		const float factor[4]{};
@@ -951,11 +1077,14 @@ float4 PSMain(VSOut i) : SV_Target {
 			ctx->VSSetShader(r_vsCopy, nullptr, 0);
 			ctx->PSSetShader(r_psCopy, nullptr, 0);
 			ctx->PSSetShaderResources(1, 1, &sceneDepth);
+			ctx->PSSetShaderResources(3, 1, &r_dugSrv);
+			ctx->PSSetConstantBuffers(0, 1, &r_frameCb);
 			ctx->OMSetBlendState(r_noColor, factor, 0xFFFFFFFF);
 			ctx->OMSetDepthStencilState(r_depthCopy, 0);
 			ctx->Draw(3, 0);
 			ID3D11ShaderResourceView* none = nullptr;
 			ctx->PSSetShaderResources(1, 1, &none);
+			ctx->PSSetShaderResources(3, 1, &none);
 		} else {
 			ctx->ClearDepthStencilView(r_dsv, D3D11_CLEAR_DEPTH, 0.0f, 0);
 		}
@@ -1022,6 +1151,14 @@ float4 PSMain(VSOut i) : SV_Target {
 		g_drawnVerts = drawnVerts;
 	}
 
+	void setDugWindow(const int origin[3], std::vector<std::uint8_t>&& cells)
+	{
+		std::lock_guard lock(g_mutex);
+		std::memcpy(g_dugOrigin, origin, sizeof(g_dugOrigin));
+		g_dugCells = std::move(cells);
+		g_dugPending = true;
+	}
+
 	void setWorldEntities(const proto::WorldEntities& entities)
 	{
 		std::lock_guard lock(g_mutex);
@@ -1061,6 +1198,9 @@ float4 PSMain(VSOut i) : SV_Target {
 		r_textures.clear();
 		release(r_dynVb);
 		r_dynCapacity = 0;
+		release(r_dugSrv);
+		release(r_dugTex);
+		r_haveDug = false;
 		r_scene.reset();
 		r_avatar.reset();
 		for (auto& [k, s] : r_sections)
