@@ -17,3 +17,4 @@ tools/me3/
 __pycache__/
 tools/re/*.csv
 .vscode/
+tools/re/*.snap
