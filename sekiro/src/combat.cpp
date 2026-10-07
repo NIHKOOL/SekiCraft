@@ -40,6 +40,7 @@ namespace sekicraft::combat
 		std::atomic<float>                            g_wolfLost{ 0 };     // HP Wolf lost, not yet sent to Minecraft
 		std::atomic<std::uint32_t>                    g_wolfAttacker{ 0 }; // the enemy that most likely did it (handle)
 		std::atomic<bool>                             g_minecraftDied{ false };
+		std::atomic<bool>                             g_killWolf{ false };  // worker -> game thread
 		std::atomic<int>                              g_wolfMaxHp{ 0 };
 		std::atomic<int>                              g_hitsApplied{ 0 }, g_kills{ 0 }, g_postureBreaks{ 0 }, g_deathblows{ 0 };
 		std::vector<DeathblowRequest>                 g_deathblowRequests;  // game thread -> worker (g_mutex)
@@ -245,11 +246,26 @@ namespace sekicraft::combat
 			g_wolfGuarded = false;
 			g_wolfLastHp = -1;
 		}
+
+		// The Minecraft player died: Wolf dies too, and Sekiro's own death (resurrection, or back
+		// to the idol) takes it from there.
+		if (g_killWolf.exchange(false) && wolf.hp > 0) {
+			game::setNoDeath(wolf, false);
+			g_wolfGuarded = false;
+			g_wolfLastHp = -1;
+			game::setHp(wolf, 0);
+			logf("combat: the Minecraft player died; Wolf dies with him");
+		}
 	}
 
 	bool takeMinecraftDeath()
 	{
 		return g_minecraftDied.exchange(false);
+	}
+
+	void killWolf()
+	{
+		g_killWolf = true;
 	}
 
 	bool takeDeathblowRequest(DeathblowRequest& out)

@@ -273,8 +273,10 @@ namespace
 					world::setWorldEntities(entities);
 			}
 			link.drainEvents([](const proto::McEvent& ev) { combat::onEvent(ev); });
-			if (combat::takeMinecraftDeath())
+			if (combat::takeMinecraftDeath() && mode == Mode::kMinecraft) {
+				combat::killWolf();  // Sekiro's death and resurrection take over
 				toSekiro("the Minecraft player died");
+			}
 
 			const bool alive = link.minecraftAlive();
 			if (alive != linked) {

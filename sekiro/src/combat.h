@@ -36,6 +36,7 @@ namespace sekicraft::combat
 	};
 	bool takeDeathblowRequest(DeathblowRequest& out);  // worker
 	bool takeMinecraftDeath();                         // worker: the Minecraft player died since last asked
+	void killWolf();                                   // worker: Wolf dies (on Sekiro's thread, next frame)
 	bool deathblowDone(const DeathblowRequest& r);     // worker: a life gone, or dead
 	void forceDeathblow(const DeathblowRequest& r);    // worker: Sekiro didn't do it; do it in memory
 
