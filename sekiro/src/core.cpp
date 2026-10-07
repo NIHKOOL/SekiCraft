@@ -217,6 +217,7 @@ namespace
 		// Minecraft's player must be standing on Wolf before it may drive him (F10), and is put back
 		// where it last stood if it falls through the world.
 		bool awaitingTeleport = false;
+		int savedHud = -1;  // Sekiro's HUD option while Minecraft has control (-1: not hidden by us)
 		game::Vec3 lastGround{};
 		bool haveLastGround = false;
 		ULONGLONG lastRescue = 0;
@@ -246,6 +247,10 @@ namespace
 				}
 			}
 			mode = Mode::kSekiro;
+			if (savedHud >= 0) {  // Sekiro's HUD back as the player had it
+				game::writeHud(std::uint8_t(savedHud));
+				savedHud = -1;
+			}
 			input::setRouting(false);
 			{
 				std::lock_guard lock(g_driveMutex);
@@ -327,6 +332,11 @@ namespace
 					logf("core: F10 ignored: %s", !inGame ? "no player" : "Minecraft isn't in its world yet");
 				else {
 					mode = Mode::kMinecraft;
+					// Only Minecraft's HUD while Minecraft has control.
+					if (std::uint8_t hud = 0; savedHud < 0 && game::readHud(hud)) {
+						savedHud = hud;
+						game::writeHud(0);
+					}
 					// Minecraft's player may have drifted (it only follows Wolf when he moves): put it on
 					// Wolf first, and only let it drive him once it's there.
 					{

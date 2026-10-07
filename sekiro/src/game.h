@@ -89,6 +89,12 @@ namespace sekicraft::game
 	// The NoDeath flag (data +0x228, bit 2): HP can't reach 0.
 	bool setNoDeath(const Character& c, bool on);
 
+	// ---- options --------------------------------------------------------------------------------
+	// Sekiro's HUD option: [GameDataMan]+0x50 is the options block, byte +0x9 the HUD setting
+	// (0 off, 1 on, others e.g. auto). Found by diffing memory around a change in Sekiro's menu.
+	bool readHud(std::uint8_t& value);
+	bool writeHud(std::uint8_t value);
+
 	// ---- physics queries ----------------------------------------------------------------------
 	// FrpgCastRay (sekiro.exe+0x94CC50 on 1.06) against FrpgHavokMan's physics world
 	// ([[sekiro.exe+0x3D6D640]+0x98]), filter 0x4E as the community tools use it. Interface facts

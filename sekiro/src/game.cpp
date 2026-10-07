@@ -386,6 +386,47 @@ namespace sekicraft::game
 		return want == flags || writeBytes(c.data + kDataFlags, &want, 1);
 	}
 
+	// ---- options --------------------------------------------------------------------------------
+
+	namespace
+	{
+		// GameDataMan: "mov rax, [rip+rel32]" 9 bytes into this pattern (Sekiro Practice CT).
+		constexpr const char* kGameDataManAob = "0f b6 da 4c 8b f1 40 32 ff 48 8b 05";
+		constexpr std::uintptr_t kGameDataManStatic106 = 0x3D5AAC0;
+		constexpr std::uintptr_t kGameDataOptions = 0x50, kOptionsHud = 0x9;
+		std::uintptr_t g_gameDataManStatic = 0;
+
+		std::uintptr_t optionsBlock()
+		{
+			if (!g_gameDataManStatic) {
+				const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+				if (const std::uintptr_t hit = scan(kGameDataManAob)) {
+					std::int32_t rel = 0;
+					read(hit + 9 + 3, rel);
+					g_gameDataManStatic = hit + 9 + 7 + rel;
+				} else {
+					g_gameDataManStatic = base + kGameDataManStatic106;
+				}
+				logf("game: GameDataMan at sekiro.exe+0x%llX%s", (unsigned long long)(g_gameDataManStatic - base),
+					g_gameDataManStatic - base == kGameDataManStatic106 ? " (matches 1.06)" : " (differs from 1.06!)");
+			}
+			const std::uintptr_t gdm = deref(g_gameDataManStatic);
+			return gdm ? deref(gdm + kGameDataOptions) : 0;
+		}
+	}
+
+	bool readHud(std::uint8_t& value)
+	{
+		const std::uintptr_t o = optionsBlock();
+		return o && read(o + kOptionsHud, value);
+	}
+
+	bool writeHud(std::uint8_t value)
+	{
+		const std::uintptr_t o = optionsBlock();
+		return o && writeBytes(o + kOptionsHud, &value, 1);
+	}
+
 	bool castRayReady()
 	{
 		return g_castRay != nullptr;
