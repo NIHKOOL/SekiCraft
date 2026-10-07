@@ -47,7 +47,9 @@ namespace sekicraft::world
 		bool                                                         g_clear = false;
 		std::shared_ptr<std::vector<std::uint8_t>>                   g_atlas;  // full atlas waiting for upload
 		std::uint32_t                                                g_atlasW = 0, g_atlasH = 0;
-		std::vector<Region>                                          g_regions;
+		// Animated atlas frames waiting for upload, newest per position only: they keep arriving while
+		// nothing is drawn (Sekiro has control), and a list grew without bound (19 GB in 5 hours).
+		std::unordered_map<std::uint64_t, Region>                    g_regions;
 		std::unordered_map<long long, std::shared_ptr<SectionMesh>>  g_sections;
 		std::atomic<long long>                                       g_bytesIn{ 0 }, g_sectionsIn{ 0 };
 
@@ -763,7 +765,7 @@ float4 PSMain(VSOut i) : SV_Target {
 			if (bytes < sizeof(r) + n)
 				return;
 			std::lock_guard lock(g_mutex);
-			g_regions.push_back({ r.x, r.y, r.width, r.height, std::vector<std::uint8_t>(p + sizeof(r), p + sizeof(r) + n) });
+			g_regions[(std::uint64_t(r.x) << 32) | r.y] = { r.x, r.y, r.width, r.height, std::vector<std::uint8_t>(p + sizeof(r), p + sizeof(r) + n) };
 			break;
 		}
 		case proto::kRenSection: {
@@ -847,7 +849,7 @@ float4 PSMain(VSOut i) : SV_Target {
 		bool clear = false;
 		std::shared_ptr<std::vector<std::uint8_t>> atlas;
 		UINT atlasW = 0, atlasH = 0;
-		std::vector<Region> regions;
+		std::unordered_map<std::uint64_t, Region> regions;
 		std::unordered_map<long long, std::shared_ptr<SectionMesh>> sections;
 		std::vector<PendingTexture> textures;
 		proto::WorldEntities entities;
@@ -879,7 +881,7 @@ float4 PSMain(VSOut i) : SV_Target {
 		if (atlas)
 			uploadAtlas(device, ctx, *atlas, atlasW, atlasH);
 		if (r_atlas) {
-			for (const Region& r : regions) {
+			for (const auto& [key, r] : regions) {
 				if (r.x + r.w > r_atlasW || r.y + r.h > r_atlasH)
 					continue;
 				const D3D11_BOX box{ r.x, r.y, 0, r.x + r.w, r.y + r.h, 1 };
