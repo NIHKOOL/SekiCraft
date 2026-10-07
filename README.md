@@ -148,5 +148,10 @@ SekiCraft is MIT-licensed (see [LICENSE](LICENSE)). It builds on and thanks:
   - the overlay compositor and the key-code table are adapted from its Skyrim side
 - **[SekiroTool](https://github.com/borgCode/SekiroTool)** by Shilkey and Centz (MIT): the ray-cast function and physics-world addresses
 - **[Sekiro Practice cheat table](https://github.com/ElaDiDu/Sekiro-Practice-CT)** by ElaDiDu: player, camera and draw-flag memory paths
-- **[MinHook](https://github.com/TsudaKageyu/minhook)** by Tsuda Kageyu (BSD-2, vendored in `sekiro/extern/minhook`)
-- **[me3](https://github.com/garyttierney/me3)**: mod loader for FromSoftware games
+- **[MinHook](https://github.com/TsudaKageyu/minhook)** by Tsuda Kageyu, including Hacker Disassembler Engine by Vyacheslav Patkov (BSD-2, vendored in `sekiro/extern/minhook` with its [LICENSE.txt](sekiro/extern/minhook/LICENSE.txt))
+- **[Gradle](https://gradle.org/)** wrapper in `fabric/gradle` (Apache-2.0)
+- **[me3](https://github.com/garyttierney/me3)**: mod loader for FromSoftware games (downloaded separately, not part of this repository)
+
+Downloaded by the Minecraft build, not part of this repository: [Fabric Loader and Fabric API](https://fabricmc.net/) (Apache-2.0), [e4mc](https://modrinth.com/mod/e4mc) (for internet multiplayer), and Minecraft itself under [Mojang's EULA](https://www.minecraft.net/eula).
+
+The screenshots show Sekiro (© FromSoftware, Activision) and Minecraft (© Mojang, Microsoft) content; they aren't covered by this project's MIT license.
