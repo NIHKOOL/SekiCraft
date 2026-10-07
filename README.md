@@ -2,6 +2,12 @@
 
 Play Sekiro: Shadows Die Twice as a Minecraft player. You walk around Ashina with Minecraft's movement and physics, see Minecraft's hotbar, hearts, hand and inventory, and collide with Sekiro's real walls and ground.
 
+![Flying over Ashina Castle in Creative mode, fireworks in hand](docs/images/hero-castle.jpg)
+
+| Digging into Sekiro's ground | Mining a castle wall | Creative flight |
+|---|---|---|
+| ![A dirt hole dug into the snowy ground of Ashina](docs/images/digging.jpg) | ![Stone and gold ore blocks dug out of a castle's stone wall](docs/images/mining-wall.jpg) | ![Flying above the castle courtyard with a diamond sword](docs/images/creative-flight.jpg) |
+
 Neither game is rewritten. Both run at the same time:
 - **Sekiro** runs its world, enemies and saves.
 - **Minecraft** runs the player.
