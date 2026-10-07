@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>
 #include <numbers>
 
 namespace sekicraft::game
@@ -48,6 +49,45 @@ namespace sekicraft::game
 	// Wolf's "Draw" flag (player ChrIns +0x1A11, bit 3; 1 = drawn). Hidden while Minecraft has
 	// control, so the first-person camera doesn't look out through his head.
 	bool setPlayerDrawn(bool drawn);
+
+	// ---- characters (ChrIns) ------------------------------------------------------------------
+	// Every character (Wolf, enemies, NPCs, invisible helpers) is a ChrIns. Interface facts from
+	// SekiroTool (MIT): handle +0x8, character id +0x68, modules +0x1FF8 -> data +0x18 (HP +0x130,
+	// max +0x134, posture +0x148, max +0x14C, flags +0x228) and physics +0x68 (facing +0x74,
+	// position +0x80). Team byte +0x74 and the physics module's pointer back to its ChrIns (+0x8)
+	// checked live. Enemies are team 6.
+
+	struct Character
+	{
+		std::uintptr_t chr = 0, data = 0, physics = 0;
+		std::uint32_t  handle = 0, characterId = 0;
+		int            team = 0;
+		Vec3           pos{};  // Sekiro coords, feet
+		float          theta = 0;
+		int            hp = 0, maxHp = 0, posture = 0, maxPosture = 0;
+	};
+
+	// Reads a character, checking that the pointer really is one (its physics module points back).
+	bool readCharacter(std::uintptr_t chr, Character& out);
+
+	// Wolf's ChrIns (0 when there is none).
+	std::uintptr_t player();
+
+	// Finds every loaded character by scanning the memory around the characters already known
+	// (Sekiro's own update lists miss sleeping ones). A few ms: call about once a second.
+	void scanCharacters(std::vector<std::uintptr_t>& out);
+
+	// HP and posture, through Sekiro's own setters where they're there (1.06), else plain writes.
+	// Game thread only.
+	void setHp(const Character& c, int hp);
+	void setPosture(const Character& c, int posture);
+	// Deathblow "lives" left (data +0x25C): the red dots over a boss's health bar.
+	int  lives(const Character& c);
+	void setLives(const Character& c, int lives);
+	// Restores posture to full (Sekiro's own setter, refill mode).
+	void refillPosture(const Character& c);
+	// The NoDeath flag (data +0x228, bit 2): HP can't reach 0.
+	bool setNoDeath(const Character& c, bool on);
 
 	// ---- physics queries ----------------------------------------------------------------------
 	// FrpgCastRay (sekiro.exe+0x94CC50 on 1.06) against FrpgHavokMan's physics world

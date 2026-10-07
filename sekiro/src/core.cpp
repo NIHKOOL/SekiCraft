@@ -7,6 +7,7 @@
 //             keyboard and mouse), Minecraft's player position drives Wolf, and Sekiro's camera
 //             becomes a first-person camera at Minecraft's eye.
 #include "collision.h"
+#include "combat.h"
 #include "game.h"
 #include "input.h"
 #include "log.h"
@@ -95,7 +96,6 @@ namespace
 	Drive                  g_drive;
 	bool                   g_driveApplied = false;  // game thread only
 	std::atomic<int>       g_camWrites{ 0 }, g_camFails{ 0 };
-	std::atomic<float>     g_centreRay{ NAN };
 
 	void applyDrive()
 	{
@@ -127,19 +127,17 @@ namespace
 		else
 			++g_camFails;
 
-		// Diagnostics for the depth buffer: how far the camera's centre ray really goes.
-		static int frame = 0;
-		if (++frame % 10 == 0 && game::castRayReady()) {
-			const float ct = std::cos(d.pitch);
-			const game::Vec3 fwd{ -std::sin(d.camTheta) * ct, -std::sin(d.pitch), -std::cos(d.camTheta) * ct };
-			game::RayHit hit{};
-			g_centreRay = game::castRay(d.eye, { fwd.x * 500, fwd.y * 500, fwd.z * 500 }, hit) ? hit.fraction * 500.0f : NAN;
-		}
 	}
 
 	void onGameThreadTick()
 	{
 		applyDrive();
+		bool minecraftDrives;
+		{
+			std::lock_guard lock(g_driveMutex);
+			minecraftDrives = g_drive.active;
+		}
+		combat::tickGameThread(minecraftDrives);
 		collision::tickGameThread();
 		if (!g_probeRequested.exchange(false))
 			return;
@@ -187,6 +185,12 @@ namespace
 		st.gameHour = 12.0f;
 
 		Mode mode = Mode::kSekiro;
+		// Minecraft's player must be standing on Wolf before it may drive him (F10), and is put back
+		// where it last stood if it falls through the world.
+		bool awaitingTeleport = false;
+		game::Vec3 lastGround{};
+		bool haveLastGround = false;
+		ULONGLONG lastRescue = 0;
 		bool f6 = false, f7 = false, f8 = false, f9 = false, f10 = false;
 		int lightPreset = 3;  // F6: off by default (scene lighting looked wrong in testing)
 		int cameraLag = 1;  // F7 cycles 0-2 (debug); 1 matches Sekiro
@@ -224,7 +228,9 @@ namespace
 				if (link.readWorldEntities(entities))
 					world::setWorldEntities(entities);
 			}
-			link.drainEvents([](const proto::McEvent&) {});
+			link.drainEvents([](const proto::McEvent& ev) { combat::onEvent(ev); });
+			if (combat::takeMinecraftDeath())
+				toSekiro("the Minecraft player died");
 
 			const bool alive = link.minecraftAlive();
 			if (alive != linked) {
@@ -282,6 +288,17 @@ namespace
 					logf("core: F10 ignored: %s", !inGame ? "no player" : "Minecraft isn't in its world yet");
 				else {
 					mode = Mode::kMinecraft;
+					// Minecraft's player may have drifted (it only follows Wolf when he moves): put it on
+					// Wolf first, and only let it drive him once it's there.
+					{
+						const game::Vec3 w = game::toMc(wolf.pos);
+						st.posX = w.x;
+						st.posY = w.y + 0.02;
+						st.posZ = w.z;
+						++st.teleportSeq;
+						awaitingTeleport = true;
+						haveLastGround = false;
+					}
 					lookYaw = game::yawToMc(wolf.theta);
 					lookPitch = 0;
 					g_camWrites = g_camFails = 0;
@@ -348,6 +365,15 @@ namespace
 				// is Minecraft's, so the floor keeps its height then).
 				if (game::castRayReady())
 					collision::update(link, true, m, st.collisionEpoch);
+				combat::update(link, mode == Mode::kMinecraft);
+
+				// A Minecraft hit on a staggered enemy: the deathblow (one life off, or dead), done in
+				// memory right away. (Letting Sekiro play its own deathblow animation was tried; it isn't
+				// wanted, and Wolf was unprotected while Sekiro had control.)
+				combat::DeathblowRequest request{};
+				if (combat::takeDeathblowRequest(request) && mode == Mode::kMinecraft)
+					combat::forceDeathblow(request);
+
 				const bool followHeight = mode == Mode::kSekiro && std::abs(m.y - floorY) > 0.3;
 				if (!game::castRayReady() && (!haveFloor || followHeight || horizDist(m.x, m.z, floorX, floorZ) > 24)) {
 					haveFloor = true;
@@ -367,12 +393,33 @@ namespace
 					st.yaw = game::yawToMc(wolf.theta);
 					st.pitch = 0;
 					const double moved = std::abs(m.x - lastSent.x) + std::abs(m.y - lastSent.y) + std::abs(m.z - lastSent.z);
-					if (moved > 0.02 && now - lastTeleport >= 50) {
+					const double drift = haveMc ? std::abs(m.x - mc.x) + std::abs(m.y - mc.y) + std::abs(m.z - mc.z) : 0.0;
+					if ((moved > 0.02 && now - lastTeleport >= 50) || (drift > 1.5 && now - lastTeleport >= 250)) {
 						++st.teleportSeq;
 						lastTeleport = now;
 						lastSent = m;
 					}
-				} else if (haveMc) {
+				} else if (mode == Mode::kMinecraft && haveMc && awaitingTeleport) {
+					// F10: waiting for Minecraft's player to land on Wolf before it drives him.
+					if (mc.teleportAck == st.teleportSeq)
+						awaitingTeleport = false;
+				} else if (mode == Mode::kMinecraft && haveMc) {
+					// Fell through the world (no Sekiro ground under it)? Back to where it last stood.
+					if (mc.flags & proto::kMcOnGround) {
+						lastGround = { float(mc.x), float(mc.y), float(mc.z) };
+						haveLastGround = true;
+					} else if (haveLastGround && mc.y < lastGround.y - 30.0 && now - lastRescue > 1000) {
+						st.posX = lastGround.x;
+						st.posY = lastGround.y + 0.02;
+						st.posZ = lastGround.z;
+						++st.teleportSeq;
+						lastRescue = now;
+						awaitingTeleport = true;
+						logf("core: Minecraft's player fell through the world at (%.1f, %.1f, %.1f); put back at (%.1f, %.1f, %.1f)", mc.x, mc.y, mc.z, lastGround.x,
+							lastGround.y, lastGround.z);
+					}
+				}
+				if (mode == Mode::kMinecraft && haveMc && !awaitingTeleport) {
 					// Minecraft drives: Wolf stands where Minecraft's player is, facing its look.
 					st.yaw = lookYaw;
 					st.pitch = lookPitch;
@@ -412,6 +459,7 @@ namespace
 				logf("%s", world::stats().c_str());
 				logf("%s", overlay::stats().c_str());
 				logf("%s", scenedepth::stats().c_str());
+				logf("%s", combat::stats().c_str());
 			}
 			if (now - lastLog >= 1000 && inGame) {
 				lastLog = now;
@@ -421,7 +469,6 @@ namespace
 					logf("sekiro: wolf (%.2f, %.2f, %.2f) theta %.3f | mc (%.2f, %.2f, %.2f) flags 0x%02x %llu fps", wolf.pos.x, wolf.pos.y, wolf.pos.z, wolf.theta,
 						mc.x, mc.y, mc.z, mc.flags, (unsigned long long)frames);
 				} else {
-					logf("depth probe: centre stored %.7f, centre ray %.2f m", scenedepth::centreDepth(), g_centreRay.load());
 					logf("minecraft: mc (%.2f, %.2f, %.2f) yaw %.1f pitch %.1f flags 0x%02x %llu fps -> wolf (%.2f, %.2f, %.2f) | camera writes %d, failed %d | %s",
 						mc.x, mc.y, mc.z, lookYaw, lookPitch, mc.flags, (unsigned long long)frames, wolf.pos.x, wolf.pos.y, wolf.pos.z, g_camWrites.load(), g_camFails.load(),
 						input::callStats().c_str());
@@ -465,6 +512,7 @@ extern "C" __declspec(dllexport) void sekicraft_stop()
 	}
 	if (g_inputHooked)
 		input::uninstall();
+	combat::shutdown();
 	collision::reset();
 	g_inputHooked = false;
 	closeLog();

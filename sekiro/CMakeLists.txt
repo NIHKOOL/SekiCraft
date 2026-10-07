@@ -24,6 +24,6 @@ target_include_directories(minhook PUBLIC extern/minhook/include)
 set_target_properties(minhook PROPERTIES LINKER_LANGUAGE C)
 
 # Everything else. Rebuild it while the game runs and the loader swaps it in.
-add_library(sekicraft_core SHARED src/core.cpp src/game.cpp src/input.cpp src/collision.cpp src/overlay.cpp src/world.cpp src/scenedepth.cpp)
+add_library(sekicraft_core SHARED src/core.cpp src/game.cpp src/input.cpp src/collision.cpp src/overlay.cpp src/world.cpp src/scenedepth.cpp src/combat.cpp)
 sekicraft_target(sekicraft_core)
 target_link_libraries(sekicraft_core PRIVATE minhook dinput8 dxguid d3d11 dxgi d3dcompiler)

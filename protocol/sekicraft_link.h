@@ -225,6 +225,22 @@ namespace sekicraft
 			return at<std::uint8_t>(proto::kOffOverlayPixels + proto::kOverlaySlotBytes * front);
 		}
 
+		// ---- actor table (we write, seqlock) -----------------------------------------------------
+		// Nearby characters, mirrored in Minecraft as invisible, hittable stand-ins.
+
+		void writeActors(const proto::ActorRecord* actors, std::uint32_t count)
+		{
+			auto* dst = at<proto::ActorTable>(proto::kOffActorTable);
+			auto seq = std::atomic_ref<std::uint32_t>(dst->seq);
+			const std::uint32_t s = seq.load(std::memory_order_relaxed);
+			seq.store(s + 1, std::memory_order_relaxed);  // odd: writing
+			std::atomic_thread_fence(std::memory_order_release);
+			count = count < proto::kMaxActors ? count : proto::kMaxActors;
+			dst->count = count;
+			std::memcpy(dst->actors, actors, sizeof(proto::ActorRecord) * count);
+			seq.store(s + 2, std::memory_order_release);
+		}
+
 		// ---- world entities (Minecraft writes, seqlock) -----------------------------------------
 		// Arrows, dropped items, block cracks, shadows and the targeted block's outline this frame.
 

@@ -201,6 +201,30 @@ Signature: `bool(world, filter, start xyz1, delta xyz0, out hitPos, out hitNorma
 - There's no scanning while Sekiro is unfocused.
 - Overhangs thinner than 0.5 blocks horizontally can be missed.
 
+## 6.2 Combat as built (Phase 6, `sekiro/src/combat.cpp`)
+
+**Finding characters:** every ChrIns passes one check, `[[c+0x1FF8]+0x68]+0x8 == c` (its physics module points back at it).
+- WorldChrMan's update lists (`+0x31A0/0x31A8/0x31B0`, nodes `{ChrIns*, f32 update interval, next*}`) are incomplete: they missed enemies 6 m and 50 m from Wolf.
+- So characters are found by scanning the 2 KB slots they occupy, inside Sekiro's 6 GB arena, around the characters already known. That takes ~20 ms once a second on the worker.
+- Teams: 6 is enemies, 1 is Wolf; 9999-HP characters (team 30) are invisible helpers and are skipped.
+
+**Minecraft hits Sekiro:**
+- Characters within 48 m go into SkyCraft's actor table and become invisible, hittable stand-ins in Minecraft.
+- Each hit event applies 12 HP and 8 posture per Minecraft damage, through Sekiro's own setters (`+0xBD64E0` HP, `+0xBD6710` posture, both prologue-checked), on the game thread.
+- **Deathblows:** a hit on a broken posture, or on a boss whose HP is gone (Sekiro holds it at 1 while lives remain), removes one life (`data+0x25C`, the red dots) and refills HP and posture. On the last life the enemy dies.
+  - Letting Sekiro play its own deathblow animation was tried (a takeover plus a synthetic click). It wasn't wanted, and Wolf was unprotected meanwhile, so it was removed.
+
+**Sekiro hits the player:**
+- While Minecraft drives, Wolf has NoDeath (`data+0x228` bit 2).
+- HP he loses becomes Minecraft damage in proportion to his maximum, and he's healed back to full.
+- The nearest enemy within 8 m is named as the attacker, so Minecraft knows the direction (shields block by it).
+
+**Safety:**
+- F10 teleports Minecraft's player onto Wolf and waits for the teleport before it drives him. In Sekiro mode it follows Wolf whenever it drifts more than 1.5 m, not only when Wolf moves.
+- A fall of more than 30 m below the last ground puts it back.
+- A Minecraft death returns control to Sekiro.
+- These came from a bug: after a respawn, Minecraft's player had dropped through the world while Wolf stood still, and F10 then dragged Wolf down after it.
+
 ## 7. Digging (the hard part)
 
 Skyrim's ground is a heightmap that SkyCraft can deform. Sekiro's ground is **static meshes with baked Havok collision**, which cannot be reshaped at runtime. The plan:
@@ -227,7 +251,7 @@ Each phase ends in something you can see working.
 | 3 ✅ | **Walk Ashina in MC physics** (ray-cast stage) | Collision field (A or B) lets you sprint-jump around Ashina Outskirts; cliffs and slopes behave |
 | 4 ✅ | **Overlay** | MC hotbar, hearts, inventory and hand drawn in Sekiro |
 | 5 ✅ | **Blocks and entities** (Sekiro lighting still to do) | Place and break blocks on Sekiro surfaces, depth-correct |
-| 6 | **Combat** | Fight Ashina soldiers with MC weapons; they hit back; posture and deathblows |
+| 6 ◐ | **Combat** (fighting, deaths, deathblows done; shields to confirm, boss sizes) | Fight Ashina soldiers with MC weapons; they hit back; posture and deathblows |
 | 7 | **Digging** | Dig holes into Sekiro's ground with correct drops (§7) |
 | 8 | **Polish** | Idol warps across dimensions, save snapshots, resurrection ↔ MC death, auto-launch |
 

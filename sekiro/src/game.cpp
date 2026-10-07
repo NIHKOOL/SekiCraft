@@ -4,6 +4,7 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <optional>
@@ -182,6 +183,207 @@ namespace sekicraft::game
 			g_havokManStatic - base == kHavokManStatic106 ? " (matches 1.06)" : " (differs from 1.06!)", (unsigned long long)(castRay - base),
 			g_castRay ? (castRay - base == kCastRay106 ? " (matches 1.06)" : " (prologue ok, differs from 1.06)") : " (prologue mismatch: ray casts off)");
 		return true;
+	}
+
+	// ---- characters ---------------------------------------------------------------------------
+
+	namespace
+	{
+		constexpr std::uintptr_t kChrHandle = 0x8, kChrCharacterId = 0x68, kChrTeam = 0x74;
+		constexpr std::uintptr_t kModulesData = 0x18;
+		constexpr std::uintptr_t kDataHp = 0x130, kDataMaxHp = 0x134, kDataPosture = 0x148, kDataMaxPosture = 0x14C, kDataFlags = 0x228;
+		constexpr std::uintptr_t kDataLives = 0x25C;  // "CurrentBossNode" in SekiroTool: deathblows still needed
+		constexpr std::uintptr_t kPhysOwner = 0x8;
+		constexpr std::uint8_t   kFlagNoDeath = 1u << 2;
+		// WorldChrMan's update lists (nodes {ChrIns*, float, next*}): seeds for the scan.
+		constexpr std::uintptr_t kWcmUpdateLists[] = { 0x31A0, 0x31A8, 0x31B0 };
+		constexpr std::uintptr_t kChrSlot = 0x800;  // ChrIns objects start on 2 KB boundaries
+
+		// Native setters (Sekiro 1.06), confirmed by their first bytes.
+		using SetHpFn = void (*)(std::uintptr_t data, int hp);
+		using SetPostureFn = void (*)(std::uintptr_t data, int posture, int flag);
+		constexpr std::uintptr_t kSetHp106 = 0xBD64E0, kSetPosture106 = 0xBD6710;
+		constexpr std::uint8_t kSetHpPrologue[16] = { 0x48, 0x89, 0x5c, 0x24, 0x18, 0x89, 0x54, 0x24, 0x10, 0x57, 0x48, 0x83, 0xec, 0x20, 0x8b, 0xb9 };
+		constexpr std::uint8_t kSetPosturePrologue[16] = { 0x48, 0x89, 0x6c, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x57, 0x48, 0x83, 0xec, 0x20, 0x41 };
+		SetHpFn      g_setHp = nullptr;
+		SetPostureFn g_setPosture = nullptr;
+		bool         g_settersChecked = false;
+
+		// The address range characters live in (inside Sekiro's big memory arena), grown as new
+		// characters turn up.
+		std::uintptr_t g_scanLo = 0, g_scanHi = 0, g_arenaLo = 0, g_arenaHi = 0;
+
+		void findSetters()
+		{
+			if (g_settersChecked)
+				return;
+			g_settersChecked = true;
+			const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+			std::uint8_t code[16] = {};
+			if (read(base + kSetHp106, code) && std::memcmp(code, kSetHpPrologue, 16) == 0)
+				g_setHp = reinterpret_cast<SetHpFn>(base + kSetHp106);
+			if (read(base + kSetPosture106, code) && std::memcmp(code, kSetPosturePrologue, 16) == 0)
+				g_setPosture = reinterpret_cast<SetPostureFn>(base + kSetPosture106);
+			logf("game: native SetHp %s, SetPosture %s", g_setHp ? "found" : "not found (plain writes)", g_setPosture ? "found" : "not found (plain writes)");
+		}
+
+		bool callSetHp(std::uintptr_t data, int hp)
+		{
+			__try {
+				g_setHp(data, hp);
+				return true;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+
+		bool callSetPostureMode(std::uintptr_t data, int posture, int mode)
+		{
+			__try {
+				g_setPosture(data, posture, mode);
+				return true;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+
+		bool callSetPosture(std::uintptr_t data, int posture)
+		{
+			__try {
+				g_setPosture(data, posture, 0);
+				return true;
+			} __except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+
+		bool looksLikeChr(std::uintptr_t p)
+		{
+			std::uintptr_t vt = 0, modules = 0, physics = 0, owner = 0;
+			return p && read(p, vt) && (vt >> 32) == 1 &&  // a vtable inside sekiro.exe (image at 0x140000000)
+				read(p + kChrModules, modules) && modules && read(modules + kModulesPhysics, physics) && physics &&
+				read(physics + kPhysOwner, owner) && owner == p;
+		}
+
+		void growRange(std::uintptr_t c)
+		{
+			const std::uintptr_t margin = 64ull << 20;
+			const std::uintptr_t lo = c > margin ? c - margin : 0, hi = c + margin;
+			if (!g_scanLo || lo < g_scanLo)
+				g_scanLo = lo;
+			if (hi > g_scanHi)
+				g_scanHi = hi;
+			if (!g_arenaLo) {
+				MEMORY_BASIC_INFORMATION mbi{};
+				if (VirtualQuery(reinterpret_cast<void*>(c), &mbi, sizeof(mbi))) {
+					g_arenaLo = reinterpret_cast<std::uintptr_t>(mbi.AllocationBase);
+					// Walk the allocation's regions to find its end.
+					std::uintptr_t a = g_arenaLo;
+					while (VirtualQuery(reinterpret_cast<void*>(a), &mbi, sizeof(mbi)) && reinterpret_cast<std::uintptr_t>(mbi.AllocationBase) == g_arenaLo)
+						a = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+					g_arenaHi = a;
+				}
+			}
+			if (g_arenaLo) {
+				g_scanLo = std::max(g_scanLo, g_arenaLo);
+				g_scanHi = std::min(g_scanHi, g_arenaHi);
+			}
+		}
+	}
+
+	bool readCharacter(std::uintptr_t chr, Character& out)
+	{
+		if (!looksLikeChr(chr))
+			return false;
+		std::uintptr_t modules = 0;
+		std::uint8_t team = 0;
+		out.chr = chr;
+		if (!read(chr + kChrModules, modules) || !read(modules + kModulesData, out.data) || !read(modules + kModulesPhysics, out.physics) || !out.data ||
+			!read(chr + kChrHandle, out.handle) || !read(chr + kChrCharacterId, out.characterId) || !read(chr + kChrTeam, team) ||
+			!read(out.physics + kPhysPos, out.pos) || !read(out.physics + kPhysTheta, out.theta) || !read(out.data + kDataHp, out.hp) ||
+			!read(out.data + kDataMaxHp, out.maxHp) || !read(out.data + kDataPosture, out.posture) || !read(out.data + kDataMaxPosture, out.maxPosture))
+			return false;
+		out.team = team;
+		return std::isfinite(out.pos.x) && std::isfinite(out.pos.y) && std::isfinite(out.pos.z);
+	}
+
+	std::uintptr_t player()
+	{
+		const std::uintptr_t wcm = deref(g_worldChrManStatic);
+		return wcm ? deref(wcm + kWcmPlayer) : 0;
+	}
+
+	void scanCharacters(std::vector<std::uintptr_t>& out)
+	{
+		out.clear();
+		const std::uintptr_t wcm = deref(g_worldChrManStatic);
+		if (!wcm)
+			return;
+		// Seeds: Wolf and whoever is in the update lists.
+		if (const std::uintptr_t hero = player(); looksLikeChr(hero))
+			growRange(hero);
+		for (std::uintptr_t head : kWcmUpdateLists) {
+			std::uintptr_t node = deref(wcm + head);
+			for (int i = 0; node && i < 4096; ++i) {
+				const std::uintptr_t c = deref(node);
+				if (!looksLikeChr(c))
+					break;
+				growRange(c);
+				node = deref(node + 0x10);
+			}
+		}
+		if (!g_scanLo || g_scanHi <= g_scanLo)
+			return;
+		// Every 2 KB slot in the range whose first word is a sekiro.exe vtable and that passes the
+		// back-pointer check.
+		for (std::uintptr_t a = (g_scanLo + kChrSlot - 1) & ~(kChrSlot - 1); a < g_scanHi; a += kChrSlot) {
+			std::uintptr_t vt = 0;
+			if (read(a, vt) && (vt >> 32) == 1 && looksLikeChr(a)) {
+				out.push_back(a);
+				growRange(a);
+			}
+		}
+	}
+
+	void setHp(const Character& c, int hp)
+	{
+		findSetters();
+		if (!(g_setHp && callSetHp(c.data, hp)))
+			writeBytes(c.data + kDataHp, &hp, sizeof(hp));
+	}
+
+	void setPosture(const Character& c, int posture)
+	{
+		findSetters();
+		if (!(g_setPosture && callSetPosture(c.data, posture)))
+			writeBytes(c.data + kDataPosture, &posture, sizeof(posture));
+	}
+
+	int lives(const Character& c)
+	{
+		int n = 0;
+		return read(c.data + kDataLives, n) ? n : 0;
+	}
+
+	void setLives(const Character& c, int lives)
+	{
+		writeBytes(c.data + kDataLives, &lives, sizeof(lives));
+	}
+
+	void refillPosture(const Character& c)
+	{
+		findSetters();
+		if (!(g_setPosture && callSetPostureMode(c.data, c.maxPosture, 1)))
+			writeBytes(c.data + kDataPosture, &c.maxPosture, sizeof(int));
+	}
+
+	bool setNoDeath(const Character& c, bool on)
+	{
+		std::uint8_t flags = 0;
+		if (!read(c.data + kDataFlags, flags))
+			return false;
+		const std::uint8_t want = on ? std::uint8_t(flags | kFlagNoDeath) : std::uint8_t(flags & ~kFlagNoDeath);
+		return want == flags || writeBytes(c.data + kDataFlags, &want, 1);
 	}
 
 	bool castRayReady()
