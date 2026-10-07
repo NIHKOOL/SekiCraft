@@ -114,6 +114,7 @@ What Sekiro starts for Minecraft is set in `sekiro\build\sekicraft.ini`, written
 | Problem | Try |
 |---|---|
 | F10 does nothing | Minecraft isn't ready yet. Wait a minute after Sekiro's title screen, then try again |
+| After F10 you can't move, or the player struggles (stuck, jittering, sinking) | Known issue. Press **F4** right after F10 to switch to Creative; that usually frees the player. Press **F4** again to go back to Survival |
 | Minecraft never starts | Check that Java 25 is installed (step 5). Minecraft's log is `fabric\run\logs\latest.log` |
 | You fall through the ground right after loading | Wait a few seconds after the load before pressing F10. If you fall more than 30 m, you're put back where you pressed F10 |
 | Minecraft keeps running after Sekiro closed | It closes 5 seconds after Sekiro. If it doesn't, end `java.exe` in Task Manager |
