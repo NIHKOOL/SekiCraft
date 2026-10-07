@@ -19,9 +19,10 @@ Two mods connect them through shared memory: a DLL inside Sekiro and a Fabric mo
 | Collision | Minecraft's physics collides with Sekiro's real ground, slopes, stairs and walls. They're measured live with the game's own ray casts around the player |
 | HUD | Minecraft's hotbar, hearts, hunger, crosshair, hand and inventory drawn over Sekiro. Clicking, scrolling and moving items work |
 | Blocks | Place and break blocks on Sekiro's ground. They're drawn in Sekiro's 3D view with Minecraft's textures and hidden behind Sekiro's walls, rocks and trees. Not yet lit by Sekiro's light |
+| Entities | Dropped items, arrows, block cracks, the targeted block's outline, Minecraft mobs and particles, and your own body in third person (F5) |
 
 **Planned:**
-- Sekiro's lighting on blocks; dropped items and other Minecraft entities
+- Sekiro's lighting on blocks
 - combat with Sekiro's enemies (posture, deathblows)
 - digging into Sekiro's ground
 
@@ -76,6 +77,7 @@ Logs: `sekiro\build\sekicraft.log` (Sekiro side) and the Gradle console or `fabr
 | Minecraft keys | WASD, Space, Shift, Ctrl, E (inventory), 1–9 and mouse wheel (hotbar), mouse buttons |
 | **F8** | Debug: logs every collision surface through Wolf's position |
 | **F7** | Debug: cycles how many frames the block camera lags Sekiro's (0–2; 1 is right) |
+| **F6** | Experimental: cycles block lighting from Sekiro's picture (normal, darker, brighter, off; off by default) |
 
 ## Project layout
 

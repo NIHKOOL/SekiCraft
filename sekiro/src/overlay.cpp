@@ -372,10 +372,12 @@ float4 PSMain(VSOut i) : SV_Target {
 				// Keep the last few cameras: if Sekiro draws a frame with an older camera than the one
 				// in memory now, the blocks must use that one too (cameraLag frames back).
 				static game::CameraState history[4]{};
+				static float feetHistory[4][3]{};
 				static bool haveHistory[4]{};
 				static int head = 0;
 				head = (head + 1) & 3;
 				haveHistory[head] = game::readFreeCamera(history[head]);
+				world::driveFeet(feetHistory[head]);
 				const int slot = (head - std::clamp(g_cameraLag.load(), 0, 3) + 4) & 3;
 				game::CameraState cam = history[slot];
 				const bool haveCam = haveHistory[slot];
@@ -388,7 +390,7 @@ float4 PSMain(VSOut i) : SV_Target {
 						cam.world[12], cam.world[13], cam.world[14]);
 				}
 				if (haveCam)
-					world::draw(device, context, rtv, bbDesc.Width, bbDesc.Height, cam, scenedepth::view());
+					world::draw(device, context, rtv, bbDesc.Width, bbDesc.Height, cam, feetHistory[slot], scenedepth::view());
 			}
 
 			bool invert = false;

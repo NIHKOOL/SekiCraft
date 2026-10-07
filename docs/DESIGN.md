@@ -130,9 +130,15 @@ From the community Sekiro Practice cheat table, verified live:
 - **Sekiro's projection is reversed with an infinite far plane:** stored depth = near / view distance, near = 0.08 (camera +0x58), sky = 0. Measured: depth × ray distance ≈ 0.08 from 1.7 m to 104 m.
 - The block renderer uses the same projection, copies Sekiro's depth into its own depth buffer each frame, and tests GREATER_EQUAL. Sekiro's walls hide blocks exactly.
 
-**Not yet:**
-- Sekiro's lighting and shadows on blocks: blocks use Minecraft's light values only.
-- Dropped items, arrows and other entities (render ring `kRenScene`, world entities).
+**Entities:** these are drawn by the same renderer.
+- **Minecraft's meshed scene:** mobs, players and particles (`kRenScene`), and the player's own body in F5 (`kRenAvatar`). Each comes with entity textures (`kRenTexture`, one per id).
+- **Built on the game side:** world entities read from shared memory (dropped items as spinning cubes or flat icons, arrows, tridents, block cracks) and the targeted block's outline. Geometry helpers are adapted from SkyCraft (MIT).
+- **Third person:** F5 moves our camera behind or in front of the player at Minecraft's own camera distance. The body is placed at the feet recorded with each camera write, so it stays in step with the one-frame-lagged camera.
+- **Vertex flags follow SkyCraft:** 1 cutout, 2 translucent, 4 untextured (ours), 8 full-detail texture (Minecraft's entities), bits 4-6 face (7 = entity). Using 8 for "untextured" first turned every skin white.
+
+**Lighting (experimental, off by default, F6 to try):** blocks lit from a mip-mapped copy of Sekiro's picture (local brightness plus a global tint). It looked wrong in testing; to revisit, probably with Sekiro's sun and shadow data instead.
+
+**Not yet:** blob shadows under entities (`kWeShadow`), Minecraft light sources lighting Sekiro (`kRenLights`).
 
 **Puppet result (Phase 2 test):** writing the position every frame from MC moves Wolf smoothly, and the camera follows. Sekiro keeps the horizontal position (drift < 2 cm) but nudges the height by a few cm, presumably snapping to its real ground. **Wolf does not animate**: he glides with his legs still, because his locomotion animation only runs when Sekiro's own movement drives him. That doesn't matter now: per the decision below, Wolf is hidden while Minecraft controls.
 
@@ -220,7 +226,7 @@ Each phase ends in something you can see working.
 | 2 ✅ | **Puppet** | Walking in MC (on a flat floor at Sekiro ground height) moves Wolf. Camera follows MC's view |
 | 3 ✅ | **Walk Ashina in MC physics** (ray-cast stage) | Collision field (A or B) lets you sprint-jump around Ashina Outskirts; cliffs and slopes behave |
 | 4 ✅ | **Overlay** | MC hotbar, hearts, inventory and hand drawn in Sekiro |
-| 5 ◐ | **Blocks** (drawn and occluded; lighting, entities remain) | Place and break blocks on Sekiro surfaces, depth-correct |
+| 5 ✅ | **Blocks and entities** (Sekiro lighting still to do) | Place and break blocks on Sekiro surfaces, depth-correct |
 | 6 | **Combat** | Fight Ashina soldiers with MC weapons; they hit back; posture and deathblows |
 | 7 | **Digging** | Dig holes into Sekiro's ground with correct drops (§7) |
 | 8 | **Polish** | Idol warps across dimensions, save snapshots, resurrection ↔ MC death, auto-launch |

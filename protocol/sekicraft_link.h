@@ -225,6 +225,28 @@ namespace sekicraft
 			return at<std::uint8_t>(proto::kOffOverlayPixels + proto::kOverlaySlotBytes * front);
 		}
 
+		// ---- world entities (Minecraft writes, seqlock) -----------------------------------------
+		// Arrows, dropped items, block cracks, shadows and the targeted block's outline this frame.
+
+		bool readWorldEntities(proto::WorldEntities& out) const
+		{
+			auto* src = at<proto::WorldEntities>(proto::kOffWorldEntities);
+			auto seq = std::atomic_ref<std::uint32_t>(src->seq);
+			for (int tries = 0; tries < 50; ++tries) {
+				const std::uint32_t s0 = seq.load(std::memory_order_acquire);
+				if (s0 & 1)
+					continue;
+				std::memcpy(&out, src, sizeof(out));
+				std::atomic_thread_fence(std::memory_order_acquire);
+				if (seq.load(std::memory_order_relaxed) == s0) {
+					if (out.count > proto::kMaxWorldEntities)
+						out.count = proto::kMaxWorldEntities;
+					return true;
+				}
+			}
+			return false;
+		}
+
 		// ---- event ring (we consume) ----------------------------------------------------------
 
 		template <class Fn>

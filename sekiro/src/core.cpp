@@ -85,8 +85,9 @@ namespace
 	{
 		bool       active = false;
 		game::Vec3 wolf{};    // Sekiro coords
-		float      theta = 0;
-		game::Vec3 eye{};     // Sekiro coords
+		float      theta = 0;     // Wolf's facing
+		game::Vec3 eye{};         // Sekiro coords
+		float      camTheta = 0;  // the camera's facing (differs in Minecraft's front F5 view)
 		float      pitch = 0; // radians
 		float      fov = 1.2f;
 	};
@@ -118,7 +119,10 @@ namespace
 		game::writePlayerPos(d.wolf);
 		game::writePlayerTheta(d.theta);
 		game::setPlayerDrawn(false);  // every frame: the game may turn it back on
-		if (game::writeCamera(d.eye, d.theta, d.pitch, d.fov))
+		const game::Vec3 feetMc = game::toMc(d.wolf);
+		const float feet[3] = { feetMc.x, feetMc.y, feetMc.z };
+		world::setDriveFeet(feet);  // the third-person body goes where the camera was written from
+		if (game::writeCamera(d.eye, d.camTheta, d.pitch, d.fov))
 			++g_camWrites;
 		else
 			++g_camFails;
@@ -127,7 +131,7 @@ namespace
 		static int frame = 0;
 		if (++frame % 10 == 0 && game::castRayReady()) {
 			const float ct = std::cos(d.pitch);
-			const game::Vec3 fwd{ -std::sin(d.theta) * ct, -std::sin(d.pitch), -std::cos(d.theta) * ct };
+			const game::Vec3 fwd{ -std::sin(d.camTheta) * ct, -std::sin(d.pitch), -std::cos(d.camTheta) * ct };
 			game::RayHit hit{};
 			g_centreRay = game::castRay(d.eye, { fwd.x * 500, fwd.y * 500, fwd.z * 500 }, hit) ? hit.fraction * 500.0f : NAN;
 		}
@@ -183,7 +187,8 @@ namespace
 		st.gameHour = 12.0f;
 
 		Mode mode = Mode::kSekiro;
-		bool f7 = false, f8 = false, f9 = false, f10 = false;
+		bool f6 = false, f7 = false, f8 = false, f9 = false, f10 = false;
+		int lightPreset = 3;  // F6: off by default (scene lighting looked wrong in testing)
 		int cameraLag = 1;  // F7 cycles 0-2 (debug); 1 matches Sekiro
 		bool linked = false, wasInGame = false, haveFloor = false, haveFloorHeight = false;
 		double floorX = 0, floorZ = 0, floorY = 0;
@@ -214,6 +219,11 @@ namespace
 			const ULONGLONG now = GetTickCount64();
 			link.heartbeat();
 			link.drainRender(&world::consume);
+			{
+				static proto::WorldEntities entities;  // ~15 KB: not on the stack
+				if (link.readWorldEntities(entities))
+					world::setWorldEntities(entities);
+			}
 			link.drainEvents([](const proto::McEvent&) {});
 
 			const bool alive = link.minecraftAlive();
@@ -248,6 +258,15 @@ namespace
 					g_probeRequested = true;
 				else
 					logf("core: F8 ignored: ray casts unavailable");
+			}
+			if (pressed(VK_F6, f6)) {
+				// Block lighting presets: midGrey is the scene brightness that counts as normally lit.
+				static constexpr struct { bool on; float midGrey; const char* name; } kPresets[] = {
+					{ true, 0.18f, "normal" }, { true, 0.30f, "darker" }, { true, 0.10f, "brighter" }, { false, 0.18f, "off (Minecraft light only)" },
+				};
+				lightPreset = (lightPreset + 1) % 4;
+				world::setSceneLighting(kPresets[lightPreset].on, kPresets[lightPreset].midGrey);
+				logf("core: F6 -> block lighting %s", kPresets[lightPreset].name);
 			}
 			if (pressed(VK_F7, f7)) {
 				cameraLag = (cameraLag + 1) % 3;
@@ -363,6 +382,19 @@ namespace
 					d.theta = game::yawFromMc(lookYaw);
 					d.eye = game::fromMc({ float(mc.eyeX), float(mc.eyeY), float(mc.eyeZ) });
 					d.pitch = game::yawFromMc(lookPitch);
+					d.camTheta = d.theta;
+					// Minecraft's F5 views: behind the player (1), or in front looking back (2), at the
+					// distance Minecraft settled on after its own camera collision.
+					if (mc.cameraMode == 1 || mc.cameraMode == 2) {
+						const float ct = std::cos(d.pitch);
+						const game::Vec3 fwd{ -std::sin(d.theta) * ct, -std::sin(d.pitch), -std::cos(d.theta) * ct };
+						const float k = mc.cameraMode == 1 ? -mc.cameraDistance : mc.cameraDistance;
+						d.eye = { d.eye.x + fwd.x * k, d.eye.y + fwd.y * k, d.eye.z + fwd.z * k };
+						if (mc.cameraMode == 2) {
+							d.camTheta += 3.14159265f;
+							d.pitch = -d.pitch;
+						}
+					}
 					// Minecraft's FOV changes while sprinting (and so around jumps); Sekiro eases into a new
 					// FOV over a few frames while our blocks would use it at once, so they'd bob. Keep
 					// Minecraft's normal 70 degrees instead.
